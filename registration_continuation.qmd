@@ -1,0 +1,564 @@
+---
+title: "registration_continuation"
+format: html
+---
+
+```{r LIBRARIES AND SETUP}
+library(googlesheets4)
+library(tidyverse)
+library(blastula)
+
+ss <- "https://docs.google.com/spreadsheets/d/18wAjNf2iROcjmqxMbuCYYjPOIsXcY4FxOzKBwyR_ZqU/edit#gid=1969315070"
+
+df <- read_sheet(ss, sheet = "Form responses 1") %>%
+  rename_with(~c("timestamp", "email", "firstname", "lastname", "country",
+                 "pass","role", "partner", "level", "years",
+                 "tshirt", "classicsize","fittedsize", 
+                 "color", "host", "agree", "volunteer"))
+
+df_clean <- df %>% 
+    mutate(
+    firstname = str_to_title(firstname),
+    size = coalesce(classicsize, fittedsize),
+    extra = if_else(str_detect(pass,"Jazz"), "Solo Jazz", if_else(str_detect(pass, "Blues"), "Blues", NA)),
+    total_price = if_else(!is.na(extra), 250, 195) + if_else(str_detect(tshirt, "Yes"), 25, 0),
+    tshirt_answer = if_else(!is.na(str_to_title(str_extract(tshirt, "(?<= - ).*(?= -)"))),
+                            str_glue("{str_to_title(str_extract(tshirt, '(?<= - ).*(?= -)'))}, {size} size in {color}"), NA),
+    total_price_aux = case_when(
+      total_price == 195 ~ "195",
+      total_price == 250 ~ "195 + 55",
+      total_price == 275 ~ "195 + 55 + 25",
+      total_price == 220 ~ "195 + 25",
+      TRUE ~ "-"
+    )
+  ) %>%
+  select(timestamp, firstname, email, country, level, role, partner, extra, tshirt_answer, total_price, total_price_aux, volunteer)
+```
+
+```{r CONFIRMATION EMAIL}
+txt_conf <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are happy to **confirm** your spot for it!")
+
+txt_waitlist <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are sad to inform you that **you are currently on the waiting list**.")
+
+txt_volunteering <- glue::glue("You told us you'd would like to **volunteer**. We kindly ask you to **hold your payment for now** until we figure out all the details about volunteers. You will receive a separate email regarding that topic in the coming days where we can discuss about the opportunities.
+
+                               _(Your spot is confirmed nevertheless and the registration is binding regardless of finding or not a volunteering spot for you. You will receive an email with the final payment amount.)_")
+
+txt_details <- function(ll = var_level, 
+                        rr = var_role,
+                        ee = var_extra, 
+                        pe = var_partner_email,
+                        tsh = var_tshirt_answer, 
+                        tp = var_total_price,
+                        tpa = var_total_price_aux){
+  out <- glue::glue("As a reminder, these are the details of your registration:
+    - **Lindy Hop** as **{rr}** in the **{ll}** level
+    - Your extra: **{coalesce(ee, \"-\")}**
+    - Your partner: **{coalesce(pe, \"-\")}**
+    - T-shirt: **{coalesce(tsh, \"-\")}**
+    - Total price: **{tp}€** ({tpa})")
+  return(out)
+}
+
+txt_followus <- glue::glue("Follow us to be up to date with all the information about Midnight Sun Swing Festival in the [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+                           
+Schedule details will be sent closer to the start of the festival but be ready to have classes on Friday afternoon")
+
+txt_reminder <- glue::glue("It has been a couple of weeks since we sent your **confirmation to the festival** but we still haven't received your payment (or we haven't seen it in our system). 
+                           
+                           We kindly ask you to proceed with the payment as soon as possible. It will help us a lot with the organisation of the event :)
+                           
+                           If you have paid in the last few days, it could be that we still have not registered the payment, but if you have paid already long time ago, **please send us a screenshot of the payment as we might have missed it (and apologies for that!)**")
+
+img_string <- add_image(file = "~/GitHub/personal_r_projects/midnightsunswing/midnightsunswing.jpeg")
+
+conf_email <- function(var_firstname = firstname, 
+                       var_level = level, 
+                       var_role = role, 
+                       var_extra = extra,
+                       var_partner_email = NA, 
+                       var_tshirt_answer = NA, 
+                       var_total_price = 195,
+                       var_total_price_aux = "195",
+                       var_volunteer = NA, xx) {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_conf}
+  
+  
+  {txt_details(var_level,var_role, var_extra, var_partner_email, var_tshirt_answer, var_total_price, var_total_price_aux)}
+  
+Please proceed with the **payment in the next 14 days** and use the code **{xx}** in the reference message.
+You can pay by SEPA bank transfer to the following account:
+  - Bank account: **FI82 7997 7996 5259 81**
+  - Payee: **Osuuskunta Swing Kollektiivi**
+  - BIC: **HOLVFIHH (Only SEPA payments)**
+  - Address: **Karjalankatu 2, 00520 Helsinki, Finland**
+  - VAT ID: **FI28578381** _(In case you need it)_
+  
+You can also pay using _ePassi/Smartum/Edenred to Black Pepper Swing_ or by card if you are unable to do a bank transfer (Send us a screenshot in that case, please).
+
+ {if(coalesce(var_volunteer,\"No\") == \"Yes\"){txt_volunteering} else {''}}
+
+  Remember to follow us for more updates: [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+  
+  Schedule details will be sent closer to the start of the festival but be prepared to have classes on Friday afternoon.
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+
+waitlist_followers_email <- function(var_firstname = firstname, 
+                       var_level = level, 
+                       var_role = role, 
+                       var_extra = extra,
+                       var_partner_email = NA, 
+                       var_tshirt_answer = NA, 
+                       var_total_price = 195,
+                       var_total_price_aux = "195") {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_waitlist}
+  
+  
+  {txt_details(var_level,var_role, var_extra, var_partner_email, var_tshirt_answer, var_total_price, var_total_price_aux)}
+  
+  We are looking forward to having you on the festival, so here are a few options you can do:
+  - **Invite a leader to register with you!** _(make sure they add your email as their partner)_
+  - Wait until a leader registers and we can get you paired with them
+  - **Switch to leader** role in either Intermediate or Advanced level _(There are still a few spots left)_
+  
+  If you decide to wait, we will send you an email when you get a spot. Otherwise you can send us an email.
+  
+  Remember to follow us for more updates: [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+
+payment_reminder <- function(var_firstname = firstname, 
+                       var_level = level, 
+                       var_role = role, 
+                       var_extra = extra,
+                       var_partner_email = NA, 
+                       var_tshirt_answer = NA, 
+                       var_total_price = 195,
+                       var_total_price_aux = "195") {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_reminder}
+  
+  
+  {txt_details(var_level,var_role, var_extra, var_partner_email, var_tshirt_answer, var_total_price, var_total_price_aux)}
+  
+Please proceed with the payment as soon as possible and remember to use the code **{xx}** in the reference message.
+You can pay by SEPA bank transfer to the following account:
+  - Bank account: **FI82 7997 7996 5259 81**
+  - Payee: **Osuuskunta Swing Kollektiivi**
+  - BIC: **HOLVFIHH (Only SEPA payments)**
+  - Address: **Karjalankatu 2, 00520 Helsinki, Finland**
+  - VAT ID: **FI28578381** _(In case you need it)_
+  
+You can also pay using _ePassi/Smartum/Edenred to Black Pepper Swing_ or by card if you are unable to do a bank transfer (Send us a screenshot in that case, please).
+
+  We are looking forward to having you on the festival.
+  
+  Remember to follow us for more updates: [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+
+```
+
+```{r EMAIL GENERATION}
+generate_email_details <- function(level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux) {
+  str_glue("As a reminder, these are the details of your registration:
+    - **Lindy Hop** as **{role}** in the **{level}** level
+    - Your extra: **{dplyr::coalesce(extra, '-')}**
+    - Your partner: **{dplyr::coalesce(partner_email, '-')}**
+    - T-shirt: **{dplyr::coalesce(tshirt_answer, '-')}**
+    - Total price: **{total_price}€** ({total_price_aux})")
+}
+
+generate_payment_details <- function(reference){
+   str_glue("Please proceed with the payment in the next 14 days using the code **{reference}** in the reference message. You can pay by SEPA bank transfer to the following account:
+   - Bank account: **FI82 7997 7996 5259 81**
+   - Payee: **Osuuskunta Swing Kollektiivi**
+   - BIC: **HOLVFIHH (Only SEPA payments)**
+   - Address: **Karjalankatu 2, 00520 Helsinki, Finland**
+   - VAT ID: **FI28578381** _(In case you need it)_ \n
+   You can also pay using _ePassi/Smartum/Edenred to Black Pepper Swing_ or by card if you are unable to do a bank transfer (Send us a screenshot in that case, please)."
+  )
+}
+
+# Define a single function to construct different types of emails
+generate_email <- function(firstname, level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, volunteer, reference, email_type) {
+  base_text <- switch(email_type,
+    "confirmation" = "Thank you for registering to Midnight Sun Swing Festival. We are happy to **confirm** your spot for it!",
+    "waitlist" = "Thank you for registering to Midnight Sun Swing Festival. We are sad to inform you that **you are currently on the waiting list**.",
+    "reminder" = "It has been a couple of weeks since we sent your **confirmation to the festival** but we still haven't received your payment (or we haven't seen it in our system). \n\nWe kindly ask you to proceed with the payment as soon as possible. It will help us a lot with the organisation of the event :)\n\nIf you have paid in the last few days, it could be that we still have not registered the payment, but if you have paid already long time ago, **please send us a screenshot of the payment as we might have missed it (and apologies for that!)**",
+    "volunteers" = "Thank you for showing your interest in **volunteering** at the Midnight Sun Swing Festival. There was more than 20 people who offered their help and we have now contacted and agreed with a few of you. Thanks! \n\n We will reach to some of you again in case we need more help, but for now we kindly ask you to proceed normally with the payment (if you haven't done so already)"
+  )
+  
+  details_text <- generate_email_details(level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux)
+  
+  payment_text <- if(email_type != "waitlist") {
+    generate_payment_details(reference)
+  } else {
+    ""
+  }
+  
+  volunteering_text <- if (volunteer == "Yes") {
+    str_glue("You told us you'd would like to **volunteer**. We kindly ask you to **hold your payment for now** until we figure out all the details about volunteers. You will receive a separate email regarding that topic in the coming days where we can discuss about the opportunities.\n\n_(Your spot is confirmed nevertheless and the registration is binding regardless of finding or not a volunteering spot for you. You will receive an email with the final payment amount.)")
+  } else {
+    ""
+  }
+  
+  follow_us_text <- str_glue("Follow us to be up to date with all the information about Midnight Sun Swing Festival in the [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)\n\nSchedule details will be sent closer to the start of the festival but be ready to have classes on Friday afternoon")
+  
+  img_string <- add_image(file = "~/GitHub/personal_r_projects/midnightsunswing/midnightsunswing.jpeg")
+  
+  full_email <- str_glue(
+    "Hello {firstname},\n\n{base_text}\n\n{details_text}\n\n{payment_text}\n\n{volunteering_text}\n\n{follow_us_text}\n\nSee you soon in Helsinki!\n{img_string}"
+  )
+  
+  return(full_email)
+}
+```
+
+```{r CONFIRMATION EMAIL}
+confirmations <- read_sheet(ss, sheet ="confirmations")
+
+new_confirmations <- confirmations %>% filter(is.na(`confirmation email sent`)) %>% filter(!is.na(firstname))
+
+for(ii in 1:nrow(new_confirmations)) {
+  dfii <- df_clean %>% inner_join(new_confirmations[ii,])
+  firstname <- dfii %>%  pluck("firstname")
+  level <- dfii %>%  pluck("level")
+  role <- dfii %>%  pluck("role")
+  extra <- dfii %>%  pluck("extra")
+  partner_email <- dfii %>% pluck("partner")
+  tshirt <- dfii %>% pluck("tshirt_answer")
+  total_price <- dfii %>% pluck("total_price")
+  total_price_aux <- dfii %>% pluck("total_price_aux")
+  volunteer <- dfii %>% pluck("volunteer")
+  xx <- dfii %>% pluck("reference")
+
+body <- conf_email(var_firstname = firstname,
+           var_level = level,
+           var_role = role,
+           var_extra = extra,
+           var_partner_email = partner_email,
+           var_tshirt_answer = tshirt,
+           var_total_price = total_price,
+           var_total_price_aux = total_price_aux,
+           var_volunteer = volunteer,
+           xx = xx) 
+
+  email <-
+    compose_email(
+      body,
+      title = "Midnight Sun Swing - Confirmation",
+      footer = "Midnight Sun Swing"
+    )
+
+
+  # email |>
+  # smtp_send(
+  #   to = dfii$email,
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "Confirmation",
+  #   credentials = creds_file(file = "gmail_creds")
+  #   )
+  cat(ii,"/",nrow(new_confirmations), "\n")
+}
+```
+
+```{r WAITLIST EMAIL}
+
+waitlist <- read_sheet(ss, sheet ="waitinglist")
+
+new_waitlist <- waitlist %>% filter(is.na(sent))
+
+for(ii in 1:nrow(new_waitlist)) {
+  dfii <- df_clean %>% inner_join(new_waitlist[ii,])
+  firstname <- dfii %>%  pluck("firstname")
+  level <- dfii %>%  pluck("level")
+  role <- dfii %>%  pluck("role")
+  extra <- dfii %>%  pluck("extra")
+  partner_email <- dfii %>% pluck("partner")
+  tshirt <- dfii %>% pluck("tshirt_answer")
+  total_price <- dfii %>% pluck("total_price")
+  total_price_aux <- dfii %>% pluck("total_price_aux")
+  volunteer <- dfii %>% pluck("volunteer")
+  xx <- dfii %>% pluck("reference")
+
+body <- waitlist_followers_email(var_firstname = firstname,
+           var_level = level,
+           var_role = role,
+           var_extra = extra,
+           var_partner_email = partner_email,
+           var_tshirt_answer = tshirt,
+           var_total_price = total_price,
+           var_total_price_aux = total_price_aux) 
+
+  email <-
+    compose_email(
+      body,
+      title = "Midnight Sun Swing - Waitlist",
+      footer = "Midnight Sun Swing"
+    )
+
+
+  # email |>
+  # smtp_send(
+  #   to = dfii$email,
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "Waitlist",
+  #   credentials = creds_file(file = "gmail_creds")
+  #   )
+  cat(ii,"/",nrow(new_waitlist), "\n")
+}
+```
+
+```{r PAYMENT REMINDER}
+
+payments <- read_sheet(ss, sheet ="confirmations")
+
+new_payments <- payments %>% filter(`Should have paid` == TRUE & is.na(`reminder sent`))
+
+for(ii in 1:nrow(new_payments)) {
+  dfii <- df_clean %>% inner_join(new_payments[ii,])
+  firstname <- dfii %>%  pluck("firstname")
+  level <- dfii %>%  pluck("level")
+  role <- dfii %>%  pluck("role")
+  extra <- dfii %>%  pluck("extra")
+  partner_email <- dfii %>% pluck("partner")
+  tshirt <- dfii %>% pluck("tshirt_answer")
+  total_price <- dfii %>% pluck("total_price")
+  total_price_aux <- dfii %>% pluck("total_price_aux")
+  volunteer <- dfii %>% pluck("volunteer")
+  xx <- dfii %>% pluck("reference")
+
+body <- payment_reminder(var_firstname = firstname,
+           var_level = level,
+           var_role = role,
+           var_extra = extra,
+           var_partner_email = partner_email,
+           var_tshirt_answer = tshirt,
+           var_total_price = total_price,
+           var_total_price_aux = total_price_aux) 
+
+  email <-
+    compose_email(
+      body,
+      title = "Midnight Sun Swing - Payment reminder",
+      footer = "Midnight Sun Swing"
+    )
+
+
+  # email |>
+  # smtp_send(
+  #   to = dfii$email,
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "Payment reminder",
+  #   credentials = creds_file(file = "gmail_creds")
+  #   )
+  cat(ii,"/",nrow(new_payments), "\n")
+}
+```
+
+```{r VOLUNTEERS }
+volunteers_payment <- read_sheet(ss, sheet ="volunteers_emailed_payment") %>% 
+  filter(is.na(email_sent)) %>% 
+  inner_join(confirmations)
+
+ii <- 2
+  dfii <- df_clean %>% inner_join(volunteers_payment[ii,])
+  firstname <- dfii %>%  pluck("firstname")
+  level <- dfii %>%  pluck("level")
+  role <- dfii %>%  pluck("role")
+  extra <- if_else(!is.na(dfii$gets), dfii$gets, dfii$extra)
+  partner_email <- dfii %>% pluck("partner")
+  tshirt <- dfii %>% pluck("tshirt_answer")
+  total_price <- dfii %>% pluck("total_price")
+  total_price_aux <- dfii %>% pluck("total_price_aux")
+  volunteer <- dfii %>% pluck("volunteer")
+  xx <- dfii %>% pluck("reference")
+  
+  body <- generate_email(firstname = firstname,
+                         level = level,
+                         role = role, 
+                         extra = extra,
+                         partner_email = partner_email,
+                         tshirt_answer = tshirt,
+                         total_price = total_price,
+                         total_price_aux = total_price_aux, 
+                         volunteer = "No",
+                         reference = xx, 
+                         email_type = "volunteers")
+  email <-
+    compose_email(
+      md(body),
+      title = "Midnight Sun Swing - Confirmation",
+      footer = "Midnight Sun Swing"
+    )
+
+
+  # email |>
+  # smtp_send(
+  #   to = dfii$email,
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "Confirmation",
+  #   credentials = creds_file(file = "gmail_creds")
+  #   )
+```
+
+
+```{r}
+
+# Dark violet: #4636A5
+# Violet: #BDB3FF
+# Light violet: #DFDAFF
+# Yellow: #FFC961
+# Light yellow: #FFF5EB
+# White: #FFFFFF
+
+aux <- df_clean %>% 
+  group_by(role, level) %>% 
+  summarise(n = n_distinct(timestamp),.groups = "keep") %>% 
+  mutate(max = if_else(level== "Intermediate", 25,50),
+         empty = max(max-n,0)) %>% 
+  mutate(full = min(max/max, n/max),
+         empty = empty/max)
+
+
+aux2 <- aux %>%
+  pivot_longer(cols = full:empty) %>% 
+  ungroup() %>% 
+  filter(level == "Advanced") %>% 
+  select(role, name, value) %>% 
+  mutate(prop = value / sum(aux2$value) *100) %>% 
+  mutate(ypos = cumsum(prop)- 0.5*prop ) %>% 
+  mutate(role = toupper(role))
+
+aux2 %>%
+  ggplot(aes(x = "" ,
+             fill = name,
+             y = value)) +
+  geom_bar(stat = "identity", width = 1)+
+  coord_polar("y", start = 0) +
+  facet_grid(rows = vars(role)) +
+  geom_text(data = . %>% filter(name == "full"),
+            aes(x = 0.05, label = scales::label_percent()(value)), 
+            size = 6, family = "VOLTAIRE", color = "#4636A5") +
+  labs(x =NULL, y = NULL, 
+       title = "Advanced") +
+  theme_void() +
+  theme(strip.text = element_text(color = "#4636A5", size = 28, hjust = 0),
+        text = element_text(family = "Voltaire",face = "bold"),
+        panel.background = element_rect(fill = "#FFF5EB", color = "#FFF5EB"),
+        plot.title.position = "plot",
+        plot.title =  element_text(color = "#4636A5", size =35,
+                                   hjust = .5, margin = margin(10,0,0,0)),
+        plot.background = element_rect(fill = "#FFF5EB", color = "#FFF5EB")) +
+  scale_fill_manual(values = c("full" = "#4636A5",
+                                "empty" = "#DFDAFF"), guide ="none")
+```
+
+```{r}
+confirmations %>% 
+  inner_join(df_clean) %>% 
+  filter(is.na(Discount)) %>% 
+  group_by(extra, level) %>% 
+  summarise(attendees= n()) %>% 
+  write_sheet(ss = ss, sheet = "Summary of groups (MONEY)")
+  
+  confirmations %>% 
+    inner_join(df_clean) %>% 
+    filter(is.na(Discount)) %>% 
+    filter(!is.na(tshirt_answer)) %>% 
+    group_by(tshirt_answer) %>% 
+    summarise(shirts = n()) %>% 
+    mutate(sum(shirts))
+  
+```
+
+
+```{r}
+# Function to generate and (hypothetically) send email
+send_email <- function(data_frame, type) {
+  # Depending on the type, set sheet and title specifics
+  sheet_name <- switch(type,
+                       "confirmation" = "confirmations",
+                       "waitlist" = "waitinglist",
+                       "reminder" = "confirmations") # Use 'confirmations' but filter differently for reminders
+  
+  title_text <- switch(type,
+                       "confirmation" = "Midnight Sun Swing - Confirmation",
+                       "waitlist" = "Midnight Sun Swing - Waitlist",
+                       "reminder" = "Midnight Sun Swing - Payment Reminder")
+  
+  subject_text <- switch(type,
+                       "confirmation" = "Confirmation",
+                       "waitlist" = "Waitlist",
+                       "reminder" = "Payment Reminder")
+  
+  # Load and filter data from Google Sheets
+  specific_data <- read_sheet(ss, sheet = sheet_name) %>%
+    # For reminders, additional filtering criteria are applied
+    mutate(`Should have paid` = if_else(type == "reminder", TRUE, `Should have paid`),
+           sent_condition = if_else(type == "reminder", is.na(`reminder sent`), is.na(`confirmation email sent`))) %>%
+    filter(sent_condition, !is.na(firstname))
+  
+  # Loop through each participant
+  for(ii in 1:nrow(specific_data)) {
+    participant_data <- data_frame %>% inner_join(specific_data[ii,], by = "email") # Assuming 'email' is the common key
+    
+    # Extract participant details
+    firstname <- participant_data$firstname
+    level <- participant_data$level
+    role <- participant_data$role
+    extra <- participant_data$extra
+    partner_email <- participant_data$partner
+    tshirt_answer <- participant_data$tshirt_answer
+    total_price <- participant_data$total_price
+    total_price_aux <- participant_data$total_price_aux
+    volunteer <- participant_data$volunteer
+    reference <- participant_data$reference # Assuming there's a 'reference' column
+    
+    # Generate email body based on type
+    email_body <- generate_email(firstname, level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, volunteer, reference, type)
+    
+    # Compose email
+    email <- compose_email(
+      body = email_body,
+      title = title_text,
+      footer = "Midnight Sun Swing"
+    )
+    
+    # Hypothetical sending function (commented out)
+    # smtp_send(
+    #   email,
+    #   to = participant_data$email,
+    #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+    #   subject = subject_text,
+    #   credentials = creds_file(file = "gmail_creds")
+    # )
+    
+    cat(ii, "/", nrow(specific_data), "emails sent for", type, "\n")
+  }
+}
+
+```
+

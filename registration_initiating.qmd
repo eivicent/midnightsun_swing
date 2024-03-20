@@ -1,0 +1,341 @@
+---
+title: "email_sending"
+format: html
+---
+
+```{r LIBRARIES}
+library(googlesheets4)
+library(tidyverse)
+library(blastula)
+
+ss <- "https://docs.google.com/spreadsheets/d/18wAjNf2iROcjmqxMbuCYYjPOIsXcY4FxOzKBwyR_ZqU/edit#gid=1969315070"
+
+df <- read_sheet(ss,sheet = "Form responses 1")
+
+names(df) <- c("timestamp", "email", "firstname", "lastname", "country",
+               "pass","role", "partner", "level", "years",
+               "tshirt", "classicsize","fittedsize", 
+               "color", "host", "agree", "volunteer")
+
+# df <- df %>% slice(1)
+```
+
+```{r}
+df_clean <- df %>% 
+  # select(firstname, lastname, email, pass, lindy_level = level, role, tshirt) %>%
+  mutate(firstname = str_to_title(firstname),
+         size = coalesce(classicsize, fittedsize),
+         extra = if_else(str_detect(pass,"Jazz"), "Solo Jazz", if_else(str_detect(pass, "Blues"), "Blues",NA)),
+         total_price = if_else(!is.na(extra), 250, 195),
+         tshirt_answer = str_to_title(str_extract(tshirt, "(?<= - ).*(?= -)")),
+        total_price = total_price + if_else(str_detect(tshirt, "Yes"),25,0),
+        tshirt_answer = if_else(!is.na(tshirt_answer),
+          glue::glue("{tshirt_answer}, {size} size in {color}"), NA),
+        total_price_aux = case_when(total_price == 195 ~ "195",
+                                    total_price == 250 ~ "195 + 55",
+                                    total_price == 275 ~ "195 + 55 + 25",
+                                    total_price == 220 ~ "195 + 25",
+                                    T ~ "-")) %>% 
+  select(timestamp, firstname, email , country,
+         level, role, partner, extra, 
+         tshirt_answer, total_price, total_price_aux, volunteer)
+```
+
+```{r}
+group_size <- 25
+solo_size <- 30
+slack <- 2
+groups = tibble(level = c("Intermediate","Advanced",
+                          "Solo", "Blues"),
+                        capacity = c(group_size, 
+                                     group_size*2, 
+                                     solo_size,
+                                     group_size*2))
+```
+
+
+```{r INTERMEDIATE}
+pivot_participants <- function(level_filter) {
+  output <- df_clean %>% 
+      filter(level == level_filter & role == "Leader") %>% 
+      filter(!is.na(partner)) %>%
+      select(leadname = firstname, 
+             leademail = email, 
+             partner, 
+             leadtime = timestamp,
+             leadprice = total_price) %>% 
+    
+    full_join(
+      df_clean %>% 
+        filter(level == level_filter & role == "Follower") %>% 
+        filter(!is.na(partner)) %>%
+        select(followname = firstname, followemail = email, 
+               partner, 
+               followtime = timestamp,
+               followprice = total_price),
+      by = c("leademail" = "partner") 
+      )  %>% 
+      union(
+        df_clean %>% 
+          mutate(international = country!="Finland") %>% 
+          filter(level == level_filter) %>% 
+          filter(is.na(partner)) %>% 
+          group_by(role) %>% 
+          arrange(desc(international), timestamp) %>% 
+          mutate(r = row_number()) %>% 
+          select(r, firstname, email, role, timestamp, total_price) %>% 
+          pivot_wider(names_from = role, 
+                      values_from = c(firstname,email, timestamp, total_price)) %>% 
+          mutate(partner = NA) %>% 
+          select(leadname = firstname_Leader,
+                 leademail = email_Leader,
+                 leadtime = timestamp_Leader,
+                 leadprice = total_price_Leader,
+                 partner,
+                 followname = firstname_Follower,
+                 followemail = email_Follower,
+                 followtime = timestamp_Follower,
+                 followprice = total_price_Follower)
+      )
+  return(output)
+}
+
+intermediate <- pivot_participants("Intermediate")
+# write_sheet(data = intermediate, ss = ss, sheet = "Intermediate")
+
+advanced <- pivot_participants("Advanced")
+# write_sheet(data = advanced, ss = ss, sheet = "Advanced")
+```
+
+
+```{r CONFIRMATION EMAIL}
+txt_conf <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are happy to **confirm** your spot for it!")
+
+txt_waitlist <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are sad to inform you that **you are currently on the waiting list**.")
+
+txt_volunteering <- glue::glue("You told us you'd would like to **volunteer**. We kindly ask you to **hold your payment for now** until we figure out all the details about volunteers. You will receive a separate email regarding that topic in the coming days where we can discuss about the opportunities.
+
+                               _(Your spot is confirmed nevertheless and the registration is binding regardless of finding or not a volunteering spot for you. You will receive an email with the final payment amount.)_")
+
+txt_details <- function(ll = var_level, 
+                        rr = var_role,
+                        ee = var_extra, 
+                        pe = var_partner_email,
+                        tsh = var_tshirt_answer, 
+                        tp = var_total_price,
+                        tpa = var_total_price_aux){
+  out <- glue::glue("These are the details of your registration:
+    - **Lindy Hop** as **{rr}** in the **{ll}** level
+    - Your extra: **{coalesce(ee, \"-\")}**
+    - Your partner: **{coalesce(pe, \"-\")}**
+    - T-shirt: **{coalesce(tsh, \"-\")}**
+    - Total price: **{tp}€** ({tpa})")
+  return(out)
+}
+
+txt_followus <- glue::glue("Follow us to be up to date with all the information about Midnight Sun Swing Festival in the [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+                           
+Schedule details will be sent closer to the start of the festival but be ready to have classes on Friday afternoon")
+
+img_string <- add_image(file = "~/GitHub/personal_r_projects/midnightsunswing/midnightsunswing.jpeg")
+
+conf_email <- function(var_firstname = firstname, 
+                       var_level = level, 
+                       var_role = role, 
+                       var_extra = extra,
+                       var_partner_email = NA, 
+                       var_tshirt_answer = NA, 
+                       var_total_price = 195,
+                       var_total_price_aux = "195",
+                       var_volunteer = NA, xx) {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_conf}
+  
+  
+  {txt_details(var_level,var_role, var_extra, var_partner_email, var_tshirt_answer, var_total_price, var_total_price_aux)}
+  
+Please proceed with the **payment in the next 14 days** and use the code **{xx}** in the reference message.
+You can pay by SEPA bank transfer to the following account:
+  - Bank account: **FI82 7997 7996 5259 81**
+  - Payee: **Osuuskunta Swing Kollektiivi**
+  - BIC: **HOLVFIHH (Only SEPA payments)**
+  - Address: **Karjalankatu 2, 00520 Helsinki, Finland**
+  - VAT ID: **FI28578381** _(In case you need it)_
+  
+You can also pay using _ePassi/Smartum/Edenred_ or by card if you are unable to do a bank transfer.
+
+ {if(coalesce(var_volunteer,\"No\") == \"Yes\"){txt_volunteering} else {''}}
+
+  Remember to follow us for more updates: [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+  
+  Schedule details will be sent closer to the start of the festival but be prepared to have classes on Friday afternoon.
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+
+
+
+waitlist_followers_email <- function(var_firstname = firstname, 
+                       var_level = level, 
+                       var_role = role, 
+                       var_extra = extra,
+                       var_partner_email = NA, 
+                       var_tshirt_answer = NA, 
+                       var_total_price = 195,
+                       var_total_price_aux = "195") {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_waitlist}
+  
+  
+  {txt_details(var_level,var_role, var_extra, var_partner_email, var_tshirt_answer, var_total_price, var_total_price_aux)}
+  
+  We are looking forward to having you on the festival, so here are a few options you can do:
+  - **Invite a leader to register with you!** _(make sure they add your email as their partner)_
+  - Wait until a leader registers and we can get you paired with them
+  - **Switch to leader** role in either Intermediate or Advanced level _(There are still a few spots left)_
+  
+  If you decide to wait, we will send you an email when you get a spot. Otherwise you can send us an email.
+  
+  Remember to follow us for more updates: [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+```
+
+
+```{r CONFIRMATION EMAIL}
+
+inter_pairing <- read_sheet(ss, sheet = "Intermediate") 
+adv_pairing <- read_sheet(ss, sheet = "Advanced") 
+
+confirmations <- inter_pairing %>% union(adv_pairing) %>%  filter(!is.na(leadname) & !is.na(followname)) %>% 
+  select(leadname, followname, leademail, followemail) %>% 
+  mutate(leads = paste(leadname, leademail, sep = "#"),
+         follow = paste(followname, followemail, sep = "#"), .keep = "unused") %>% 
+  pivot_longer(cols = leads:follow) %>% 
+  select(-name) %>% 
+  separate(value, into = c("firstname", "email"),sep = "#") %>% 
+  mutate(reference = paste0("MSS",row_number()))
+
+# write_sheet(confirmations, ss,
+            # "confirmations")
+
+for(ii in 1:nrow(confirmations)) {
+  dfii <- df_clean %>% inner_join(confirmations[ii,])
+  firstname <- dfii %>%  pluck("firstname")
+  level <- dfii %>%  pluck("level")
+  role <- dfii %>%  pluck("role")
+  extra <- dfii %>%  pluck("extra")
+  partner_email <- dfii %>% pluck("partner")
+  tshirt <- dfii %>% pluck("tshirt_answer")
+  total_price <- dfii %>% pluck("total_price")
+  total_price_aux <- dfii %>% pluck("total_price_aux")
+  volunteer <- dfii %>% pluck("volunteer")
+  xx <- dfii %>% pluck("reference")
+
+body <- conf_email(var_firstname = firstname,
+           var_level = level,
+           var_role = role,
+           var_extra = extra,
+           var_partner_email = partner_email,
+           var_tshirt_answer = tshirt,
+           var_total_price = total_price,
+           var_total_price_aux = total_price_aux,
+           var_volunteer = volunteer,
+           xx = xx) 
+
+  email <-
+    compose_email(
+      body,
+      title = "Midnight Sun Swing - Confirmation",
+      footer = "Midnight Sun Swing"
+    )
+
+  # email |>
+  # smtp_send(
+  #   to = dfii$email,
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "Confirmation",
+  #   credentials = creds_file(file = "gmail_creds")
+  #   )
+  cat(ii,"/",nrow(confirmations), "\n")
+}
+```
+
+```{r}
+inter_pairing <- read_sheet(ss, sheet = "Intermediate") 
+adv_pairing <- read_sheet(ss, sheet = "Advanced") 
+
+waitinglist <- inter_pairing %>% union(adv_pairing) %>%  filter(is.na(leadname) | is.na(followname)) %>% 
+  select(leadname, followname, leademail, followemail) %>% 
+  mutate(leads = paste(leadname, leademail, sep = "#"),
+         follow = paste(followname, followemail, sep = "#"), .keep = "unused") %>% 
+  pivot_longer(cols = leads:follow) %>% 
+  select(-name) %>% 
+  separate(value, into = c("firstname", "email"),sep = "#") %>% 
+  filter(!is.na(firstname)) %>% 
+  filter(firstname != "NA")
+
+# write_sheet(waitinglist, ss, "waitinglist")
+
+waitinglist2 <- filter(waitinglist, 
+                      !email %in% c("ragav.sathish@gmail.com",
+                                    "terhi.jurvela@gmail.com"))
+# waitinglist2 <- df_clean %>% slice_tail(n = 1) %>% 
+  # select(firstname, email)
+for(ii in 1:nrow(waitinglist2)) {
+  dfii <- df_clean %>% inner_join(waitinglist2[ii,])
+  firstname <- dfii %>%  pluck("firstname")
+  level <- dfii %>%  pluck("level")
+  role <- dfii %>%  pluck("role")
+  extra <- dfii %>%  pluck("extra")
+  partner_email <- dfii %>% pluck("partner")
+  tshirt <- dfii %>% pluck("tshirt_answer")
+  total_price <- dfii %>% pluck("total_price")
+  total_price_aux <- dfii %>% pluck("total_price_aux")
+
+body <- waitlist_followers_email(var_firstname = firstname,
+           var_level = level,
+           var_role = role,
+           var_extra = extra,
+           var_partner_email = partner_email,
+           var_tshirt_answer = tshirt,
+           var_total_price = total_price,
+           var_total_price_aux = total_price_aux) 
+
+email <-
+  compose_email(
+    body,
+    title = "Midnight Sun Swing - Waitlist",
+    footer = "Midnight Sun Swing"
+  )
+
+  # email |>
+  # smtp_send(
+  #   to = dfii$email,
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "Waitlist",
+  #   credentials = creds_file(file = "gmail_creds")
+  #   )
+
+  cat(ii,"/",nrow(waitinglist2), "\n")
+}
+```
+
+
+```{r}
+df_clean %>% 
+  group_by(level, role) %>% 
+  summarise(n_distinct(timestamp))
+```
+

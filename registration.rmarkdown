@@ -1,0 +1,229 @@
+---
+title: "email_sending"
+format: html
+---
+
+```{r LIBRARIES}
+library(googlesheets4)
+library(tidyverse)
+library(blastula)
+
+ss <- "https://docs.google.com/spreadsheets/d/18wAjNf2iROcjmqxMbuCYYjPOIsXcY4FxOzKBwyR_ZqU/edit#gid=1969315070"
+
+df <- read_sheet(ss,sheet = "Form responses 1")
+
+names(df) <- c("timestamp", "email", "firstname", "lastname", "country",
+               "pass","role", "partner", "level", "years",
+               "tshirt", "classicsize","fittedsize", 
+               "color", "host", "agree", "volunteer")
+
+# df <- df %>% slice(1)
+```
+
+```{r}
+df_clean <- df %>% 
+  # select(firstname, lastname, email, pass, lindy_level = level, role, tshirt) %>% 
+  mutate(firstname = str_to_title(firstname),
+         size = coalesce(classicsize, fittedsize),
+         extra = if_else(str_detect(pass,"Jazz"), "Solo Jazz", if_else(str_detect(pass, "Blues"), "Blues",NA)),
+         total_price = if_else(!is.na(extra), 250, 195),
+         tshirt_answer = str_to_title(str_extract(tshirt, "(?<= - ).*(?= -)")),
+        total_price = total_price + if_else(str_detect(tshirt, "Yes"),25,0),
+        tshirt_answer = if_else(!is.na(tshirt_answer),
+          glue::glue("{tshirt_answer}, {size} size in {color}"), NA),
+        total_price_aux = case_when(total_price == 195 ~ "195",
+                                    total_price == 250 ~ "195 + 55",
+                                    total_price == 275 ~ "195 + 55 + 25",
+                                    total_price == 220 ~ "195 + 25",
+                                    T ~ "-")) %>% 
+  select(firstname, email , country,
+         level, role, partner, extra, 
+         tshirt_answer, total_price, total_price_aux)
+```
+
+```{r}
+group_size <- 25
+solo_size <- 30
+slack <- 2
+groups = tibble(level = c("Intermediate","Advanced",
+                          "Solo", "Blues"),
+                        capacity = c(group_size, 
+                                     group_size*2, 
+                                     solo_size,
+                                     group_size*2))
+```
+
+```{r}
+df_clean %>% filter(level == "Intermediate") %>% 
+  select(email, role, country)  %>% 
+  mutate(country = if_else(country == "Finland", "ZFinland", country)) %>% 
+  group_by(role) %>% 
+  arrange(country) %>% 
+  mutate(r = row_number()) 
+  pivot_wider(names_from = "role", values_from = "email",
+              values_fn = list) %>% View()
+  
+```
+
+```{r CONFIRMATION EMAIL}
+txt_conf <- glue::glue("We are happy to **confirm** your spot for the **Midnight Sun Swing Festival**!")
+
+txt_waitlist <- glue::glue("You are now on the waitlist until we can partner you up with another festival attendee, as we want to keep the balance of leaders and followers")
+
+txt_waitlist <- glue::glue("We are sad to inform you that **there are no more spots left for the level and role you selected**")
+
+txt_details <- function(ll = var_level, 
+                        rr = var_role,
+                        ee = var_extra, 
+                        pe = var_partner_email,
+                        tsh = var_tshirt_answer, 
+                        tp = var_total_price,
+                        tpa = var_total_price_aux){
+  out <- glue::glue("These are the details of your registration:
+    - Lindy Hop as {rr} in the {ll} level
+    - Your extra: {coalesce(ee, \"-\")}
+    - Your partner: {coalesce(pe, \"-\")}
+    - T-shirt: {coalesce(tsh, \"-\")}
+    - Total price: {tp} ({tpa}))")
+  return(out)
+}
+
+ii <- 1 
+aux <- df_clean[ii,]
+txt_details(aux$level, aux$role, aux$extra, aux$partner, aux$tshirt_answer, aux$total_price, aux$total_price_aux)
+
+txt_followus <- glue::glue("Follow us to be up to date with all the information about Midnight Sun Swing Festival in the [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+                           
+Schedule details will be sent closer to the start of the festival but be ready to have classes on Friday afternoon")
+
+img_file_path <-
+  system.file(mustWork = T,
+    "img", "~/GitHub/personal_r_projects/midnightsunswing/fb_banner.png",
+    package = "blastula"
+  )
+
+img_string <- add_image(file = "~/GitHub/personal_r_projects/midnightsunswing/midnightsunswing.jpeg")
+
+conf_email <- function(var_firstname = firstname, 
+                       var_level = level, 
+                       var_role = role, 
+                       var_extra = extra,
+                       var_partner_email = NA, 
+                       var_tshirt_answer = NA, 
+                       var_size = NA,
+                       var_color = NA ,
+                       var_total_price = 195,
+                       var_total_price_aux = "195", xx) {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_conf}
+  
+  
+  {txt_details(var_level,var_role, var_extra, var_partner_email, var_tshirt_answer, var_total_price, var_total_price_aux)}
+  
+Please proceed with the **payment in the next 14 days** and use the code **MSSF{xx}** in the reference message.
+You can pay by SEPA bank transfer to the following account:
+  - Bank account: FI82 7997 7996 5259 81
+  - Payee: Osuuskunta Swing Kollektiivi
+  - BIC: HOLVFIHH (Only SEPA payments)
+  - Address: Karjalankatu 2, 00520 Helsinki, Finland
+  - VAT ID: FI28578381
+
+You can also pay using _ePassi/Smartum/Edenred_ or by card if you are unable to do a bank transfer.
+  
+  Once you have paid please send us the payment confirmation :) 
+  
+  Remember to follow us for more updates: [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/OjFPPrO4)
+  
+  Schedule details will be sent closer to the start of the festival but be prepared to have classes on Friday afternoon.
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+
+ii <- 1
+dfii <- df_clean %>% slice(ii)
+firstname <- dfii %>%  pluck("firstname")
+level <- dfii %>%  pluck("level")
+role <- dfii %>%  pluck("role")
+extra <- dfii %>%  pluck("extra")
+partner_email <- dfii %>% pluck("partner")
+tshirt <- dfii %>% pluck("tshirt")
+size <- dfii %>% pluck("classicsize") 
+color <- dfii %>% pluck("color")
+xx <- ii
+
+conf_email(xx = xx) 
+
+
+email <-
+  compose_email(
+    conf_email(xx = xx) ,
+    title = "Confirmation",footer = "MIDNIGHT SUN SWING TEAM"
+  )
+
+email
+# 
+# email |>
+#   smtp_send(
+#     to = "nicholas.r.tangel@gmail.com",
+#     from = "midnightsunswing@gmail.com",
+#     subject = "CONFIRMATION",
+#     credentials = creds_file(file = "gmail_creds")
+#     )
+```
+
+```{r CLEAN DATASET}
+df %>% 
+  select(firstname, lastname, email, pass, lindy_level, role, tshirt) %>% 
+  mutate(intermediate = if_else(lindy_level == "Advanced", T, F),
+         advanced = if_else(lindy_level == "Intermediate", T, F),
+        solo = if_else(str_detect(pass, "Jazz"),T, F),
+         blues = if_else(str_detect(pass, "Blues"),T, F),
+        total_price = if_else(solo|blues, 250, 195),
+        total_price = total_price + if_else(str_detect(tshirt, "Yes"),25,0))
+```
+
+```{r}
+
+
+```
+
+```{r}
+balance_check <- df %>%
+  filter(role %in% c("Leader", "Follower")) %>%
+  group_by(pass, level, role) %>%
+  summarize(count = n()) %>%
+  pivot_wider(names_from = role, values_from = count, values_fill = 0)
+
+balance_check <- balance_check %>%
+  inner_join(group_capacity) %>% 
+  mutate(balance_status = ifelse(abs(Leader-Follower) <= slack, "Balanced", "Unbalanced"),
+         group_status = ifelse(max(Leader, Follower) >= capacity, "Sold Out", "Space"))
+
+
+```
+
+```{r}
+# Create a function to assign status
+assign_status <- function(level, role, balance_data) {
+  balance_info <- balance_data[balance_data$level == level, ]
+  if (role == "Leader" && balance_info$Leader > balance_info$Follower) {
+    return("waitlist")
+  } else if (role == "Follower" && balance_info$Follower > balance_info$Leader) {
+    return("waitlist")
+  } else {
+    return("accepted")
+  }
+}
+
+# Add status to the original dataset
+df_processed <- df %>%
+  mutate(status = mapply(assign_status, level, role, MoreArgs = list(balance_data = balance_check))) %>%
+  select(firstname, lastname, email, pass, level, role, tshirt, status)
+
+```
+
