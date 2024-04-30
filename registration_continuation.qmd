@@ -15,16 +15,26 @@ df <- read_sheet(ss, sheet = "Form responses 1") %>%
                  "pass","role", "partner", "level", "years",
                  "tshirt", "classicsize","fittedsize", 
                  "color", "host", "agree", "volunteer"))
+```
 
+
+```{r CLEAN}
 df_clean <- df %>% 
     mutate(
-    firstname = str_to_title(firstname),
+    main = if_else(str_detect(pass, "Party"), "**Party Pass**",
+                   str_glue("**Lindy Hop** as **{role}** in the **{level}** level")),
     size = coalesce(classicsize, fittedsize),
     extra = if_else(str_detect(pass,"Jazz"), "Solo Jazz", if_else(str_detect(pass, "Blues"), "Blues", NA)),
-    total_price = if_else(!is.na(extra), 250, 195) + if_else(str_detect(tshirt, "Yes"), 25, 0),
+    total_price = case_when(
+      is.na(extra) & str_detect(pass, "Party") ~ 70,
+      !is.na(extra) & str_detect(pass, "Party") ~ 110,
+      !is.na(extra) & !str_detect(pass, "Party") ~ 250,
+      T ~ 195) + if_else(str_detect(tshirt, "Yes"), 25, 0),
     tshirt_answer = if_else(!is.na(str_to_title(str_extract(tshirt, "(?<= - ).*(?= -)"))),
                             str_glue("{str_to_title(str_extract(tshirt, '(?<= - ).*(?= -)'))}, {size} size in {color}"), NA),
     total_price_aux = case_when(
+      total_price == 110 ~ "110",
+      total_price == 135 ~ "110 + 25",
       total_price == 195 ~ "195",
       total_price == 250 ~ "195 + 55",
       total_price == 275 ~ "195 + 55 + 25",
@@ -32,13 +42,13 @@ df_clean <- df %>%
       TRUE ~ "-"
     )
   ) %>%
-  select(timestamp, firstname, email, country, level, role, partner, extra, tshirt_answer, total_price, total_price_aux, volunteer)
+  select(timestamp, firstname, email, country, main, level, role, partner, extra, tshirt_answer, total_price, total_price_aux, volunteer)
 ```
 
 ```{r EMAIL GENERATION}
-generate_email_details <- function(level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux) {
+generate_email_details <- function(level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, main) {
   str_glue("As a reminder, these are the details of your registration:
-    - **Lindy Hop** as **{role}** in the **{level}** level
+    - {main} 
     - Your extra: **{dplyr::coalesce(extra, '-')}**
     - Your partner: **{dplyr::coalesce(partner_email, '-')}**
     - T-shirt: **{dplyr::coalesce(tshirt_answer, '-')}**
@@ -57,15 +67,15 @@ generate_payment_details <- function(reference){
 }
 
 # Define a single function to construct different types of emails
-generate_email <- function(firstname, level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, volunteer, reference, email_type) {
+generate_email <- function(firstname, level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, volunteer, reference, email_type, main) {
   base_text <- switch(email_type,
     "confirmation" = "Thank you for registering to Midnight Sun Swing Festival. We are happy to **confirm** your spot for it!",
-    "waitlist" = "Thank you for registering to Midnight Sun Swing Festival. We are sad to inform you that **you are currently on the waiting list**.",
+    "waitlist" = "Thank you for registering to Midnight Sun Swing Festival. We are sad to inform you that **you are currently on the waiting list**",
     "reminder" = "It has been a couple of weeks since we sent your **confirmation to the festival** but we still haven't received your payment (or we haven't seen it in our system). \n\nWe kindly ask you to proceed with the payment as soon as possible. It will help us a lot with the organisation of the event :)\n\nIf you have paid in the last few days, it could be that we still have not registered the payment, but if you have paid already long time ago, **please send us a screenshot of the payment as we might have missed it (and apologies for that!)**",
     "volunteers" = "Thank you for showing your interest in **volunteering** at the Midnight Sun Swing Festival. There was more than 20 people who offered their help and we have now contacted and agreed with a few of you. Thanks! \n\n We will reach to some of you again in case we need more help, but for now we kindly ask you to proceed normally with the payment (if you haven't done so already)"
   )
   
-  details_text <- generate_email_details(level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux)
+  details_text <- generate_email_details(level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, main)
   
   payment_text <- if(email_type != "waitlist") {
     generate_payment_details(reference)
@@ -91,13 +101,13 @@ generate_email <- function(firstname, level, role, extra, partner_email, tshirt_
 }
 ```
 
-```{r SEND EMAILS}
+```{r SEND EMAILS DATA PREPARATION}
 all_data <- df_clean %>% 
-  left_join(read_sheet(ss, "confirmations")) %>% 
+  left_join(read_sheet(ss, "confirmations") %>% mutate(confirmation = TRUE)) %>% 
   left_join(read_sheet(ss, "waitinglist")) %>% 
   left_join(read_sheet(ss, "volunteers_emailed_payment"))
 
-type <- "volunteers"
+type <- "reminder"
 
 title_text <- switch(type,
                      "confirmation" = "Confirmation",
@@ -114,6 +124,7 @@ specific_data <- all_data %>%
 if(type == "confirmation") {
   specific_data <- all_data %>% 
     filter(is.na(`confirmation email sent`)) %>% 
+    filter(confirmation) %>% 
     filter(!is.na(firstname))
 }
 if(type == "waitlist") {
@@ -125,12 +136,14 @@ if(type == "waitlist") {
 if(type == "reminder"){
   specific_data <- all_data %>% 
     filter(`Should have paid` == TRUE & is.na(`reminder sent`))
-} 
+}
+```
 
 
+```{r SEND EMAILS}
 for(ii in 1:nrow(specific_data)) {
     
-    firstname <- specific_data$firstname[ii]
+    firstname <- str_to_title(specific_data$firstname[ii])
     level <- specific_data$level[ii]
     role <- specific_data$role[ii]
     extra <- if_else(type == "volunteers", specific_data$gets[ii],
@@ -139,11 +152,14 @@ for(ii in 1:nrow(specific_data)) {
     tshirt_answer <- specific_data$tshirt_answer[ii]
     total_price <- specific_data$total_price[ii]
     total_price_aux <- specific_data$total_price_aux[ii]
-    volunteer <- if_else(type == "volunteers", "No",specific_data$volunteer[ii])
+    volunteer <- if_else(type %in% c("volunteers","reminder"), 
+                         "No",
+                         coalesce(specific_data$volunteer[ii],"No"))
     reference <- specific_data$reference[ii]
+    main  <- specific_data$main[ii]
     
     # Generate email body based on type
-    email_body <- generate_email(firstname, level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, volunteer, reference, type)
+    email_body <- generate_email(firstname, level, role, extra, partner_email, tshirt_answer, total_price, total_price_aux, volunteer, reference, type, main)
     
     # Compose email
     email <- compose_email(
@@ -151,15 +167,17 @@ for(ii in 1:nrow(specific_data)) {
       title = title_text,
       footer = "Midnight Sun Swing"
     )
-# 
-#     smtp_send(
-#       email,
-#       to = specific_data$email[ii],
-#       from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
-#       subject = title_text,
-#       credentials = creds_file(file = "~/gmail_creds")
-#     )
-#     
+
+    email
+    
+  # smtp_send(
+  #   email,
+  #   to = specific_data$email[ii],
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = title_text,
+  #   credentials = creds_file(file = "~/gmail_creds")
+  # )
+
     cat(ii, "/", nrow(specific_data), "emails sent for", type, "\n")
 }
 ```
@@ -186,7 +204,7 @@ aux <- df_clean %>%
 aux2 <- aux %>%
   pivot_longer(cols = full:empty) %>% 
   ungroup() %>% 
-  filter(level == "Advanced") %>% 
+  filter(level == "Intermediate") %>% 
   select(role, name, value) %>% 
   mutate(prop = value / sum(aux2$value) *100) %>% 
   mutate(ypos = cumsum(prop)- 0.5*prop ) %>% 
@@ -217,16 +235,24 @@ aux2 %>%
 ```
 
 ```{r}
-confirmations %>% 
-  inner_join(df_clean) %>% 
-  filter(is.na(Discount)) %>% 
+all_data %>% 
+  filter(!is.na(`confirmation email sent`)) %>% 
+  filter(is.na(Discount)) %>%
+  group_by(main = if_else(str_detect(main, "Party"), "Party", "Classes"), extra, level) %>% 
+  summarise(attendees= n(),
+            money = sum(total_price - if_else(!is.na(tshirt_answer),25,0))) %>% 
+  arrange(main, extra) %>% 
+  write_sheet(ss = ss, sheet = "Groups (MONEY)")
+
+all_data %>% 
+  filter(!is.na(`confirmation email sent`)) %>% 
   group_by(extra, level) %>% 
   summarise(attendees= n()) %>% 
-  write_sheet(ss = ss, sheet = "Summary of groups (MONEY)")
+  write_sheet(ss = ss, sheet = "Groups (SIZE)")
   
-  confirmations %>% 
-    inner_join(df_clean) %>% 
-    filter(is.na(Discount)) %>% 
+  all_data %>% 
+    filter(!is.na(`confirmation email sent`)) %>% 
+    filter(is.na(Discount)) %>%
     filter(!is.na(tshirt_answer)) %>% 
     group_by(tshirt_answer) %>% 
     summarise(shirts = n()) %>% 
