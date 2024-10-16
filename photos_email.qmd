@@ -1,0 +1,68 @@
+---
+title: "photos_email"
+format: html
+---
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+ss <- "https://docs.google.com/spreadsheets/d/18wAjNf2iROcjmqxMbuCYYjPOIsXcY4FxOzKBwyR_ZqU/edit#gid=1969315070"
+```
+
+```{r}
+img_string <- add_image(file = "~/GitHub/midnightsun_swing/midnightsunswing.jpeg")
+```
+
+```{r}
+email <- str_glue("
+Hello dancers!
+
+We hope you are having a great summer!
+  
+We are bringing two exciting announcements:
+  
+- Midnight Sun Swing - 2nd Edition will happen in Helsinki on 13th to 15th of June 2025. We are very happy with all the positive and negative feedback received and can't wait to work on making the next edition even better.
+  
+- The photos from the 1st edition are now available!
+
+We can't wait to see you all again and share more dancing together.
+
+Stay tuned for more updates!
+
+The Midnight Sun Swing Team
+
+{img_string}
+")
+```
+
+```{r}
+thanksemails <- read_sheet(ss, sheet = "Thankyou") %>% filter(!is.na(email))
+thanksemails <- thanksemails$email
+```
+
+
+```{r}
+email_to_send <- compose_email(
+    body = md(email),
+    title = "Thanks for coming to Midnight Sun Swing",
+    footer = "Midnight Sun Swing"
+    )
+
+email_to_send 
+
+batch1 <- thanksemails[1:50]
+batch2 <- thanksemails[51:100]
+batch3 <- thanksemails[101:150]
+batch4 <- thanksemails[151:185]
+
+# smtp_send(
+#   email_to_send,
+#   to = "midnightsunswing@gmail.com",
+#   bcc = "minna.yliollila@gmail.com",
+#   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+#   subject = "Thank you - Midnight Sun Swing",
+#   credentials = creds_file(file = "~/gmail_creds")
+#   )
+```
+

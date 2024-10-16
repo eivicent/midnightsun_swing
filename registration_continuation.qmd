@@ -99,6 +99,7 @@ generate_email <- function(firstname, level, role, extra, partner_email, tshirt_
   
   return(full_email)
 }
+
 ```
 
 ```{r SEND EMAILS DATA PREPARATION}
@@ -107,7 +108,7 @@ all_data <- df_clean %>%
   left_join(read_sheet(ss, "waitinglist")) %>% 
   left_join(read_sheet(ss, "volunteers_emailed_payment"))
 
-type <- "reminder"
+type <- "confirmation"
 
 title_text <- switch(type,
                      "confirmation" = "Confirmation",
@@ -135,10 +136,9 @@ if(type == "waitlist") {
 }
 if(type == "reminder"){
   specific_data <- all_data %>% 
-    filter(`Should have paid` == TRUE & is.na(`reminder sent`))
+    filter(`Should have paid` == TRUE)
 }
 ```
-
 
 ```{r SEND EMAILS}
 for(ii in 1:nrow(specific_data)) {
@@ -169,14 +169,14 @@ for(ii in 1:nrow(specific_data)) {
     )
 
     email
-    
-  # smtp_send(
-  #   email,
-  #   to = specific_data$email[ii],
-  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
-  #   subject = title_text,
-  #   credentials = creds_file(file = "~/gmail_creds")
-  # )
+
+    # smtp_send(
+    #   email,
+    #   to = specific_data$email[ii],
+    #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+    #   subject = title_text,
+    #   credentials = creds_file(file = "~/gmail_creds")
+    # )
 
     cat(ii, "/", nrow(specific_data), "emails sent for", type, "\n")
 }
@@ -235,28 +235,60 @@ aux2 %>%
 ```
 
 ```{r}
-all_data %>% 
-  filter(!is.na(`confirmation email sent`)) %>% 
+all_data %>%
+  filter(confirmation) %>% 
   filter(is.na(Discount)) %>%
-  group_by(main = if_else(str_detect(main, "Party"), "Party", "Classes"), extra, level) %>% 
+  group_by(tshirt_answer) %>% 
+  summarise(n = n()) %>% 
+  filter(!is.na(tshirt_answer)) %>% 
+  summarise(sum(n))
+  group_by(Workshop) %>% 
   summarise(attendees= n(),
-            money = sum(total_price - if_else(!is.na(tshirt_answer),25,0))) %>% 
-  arrange(main, extra) %>% 
+            money = sum(total_price - if_else(!is.na(tshirt_answer),25,0)))
+  arrange(main, extra) 
   write_sheet(ss = ss, sheet = "Groups (MONEY)")
 
-all_data %>% 
-  filter(!is.na(`confirmation email sent`)) %>% 
-  group_by(extra, level) %>% 
-  summarise(attendees= n()) %>% 
-  write_sheet(ss = ss, sheet = "Groups (SIZE)")
-  
-  all_data %>% 
-    filter(!is.na(`confirmation email sent`)) %>% 
-    filter(is.na(Discount)) %>%
-    filter(!is.na(tshirt_answer)) %>% 
-    group_by(tshirt_answer) %>% 
-    summarise(shirts = n()) %>% 
-    mutate(sum(shirts))
-  
+```
+
+
+```{r TSHIRTS}
+
+
+sstshirts <- "https://docs.google.com/spreadsheets/d/1DBnUuxqG9SJkwiNGbf8gA4S276ERwa5gi6IhnEIiGZw/edit#gid=2095043834"
+
+dftshirts <- read_sheet(sstshirts, sheet = "Form responses 1") 
+
+clean_df_tshirts <-dftshirts %>% 
+  pivot_longer(cols = !Timestamp:`Email address`) %>% 
+  filter(!is.na(value)) %>% 
+  mutate(color = if_else(str_detect("YELLOW", name), "Dusty Yellow", "Natural White")) %>% 
+  mutate(style = if_else(str_detect(name, "CLASSIC"), "Classic", "Fitted")) %>% 
+  mutate(discount = if_else(str_detect(`Email address`, "iines"), T, F)) %>% 
+  count(discount, style, color, size = value) %>% 
+ union(
+    df %>% 
+      inner_join(all_data) %>% 
+      filter(!is.na(`confirmation email sent`)) %>% 
+      mutate(style = if_else(is.na(classicsize), "Fitted", "Classic")) %>% 
+      count(discount = coalesce(Discount,F), style, color, size = coalesce(classicsize, fittedsize)) %>% 
+      filter(!is.na(color))
+    ) %>%
+  group_by(discount, style, color, size) %>% 
+  summarise(n = sum(n)) %>% ungroup() 
+  # mutate(total = sum(n)) 
+
+clean_df_tshirts %>% 
+  group_by(style, color,size) %>% 
+  summarise(n = sum(n)) %>% 
+  mutate(size = factor(size, levels = c("XS","S", "M", "L", "XL", "2XL"))) %>% 
+  arrange(size) %>% 
+  pivot_wider(names_from = size, values_from = n) %>% 
+  gt::gt(groupname_col = NULL, rowname_col = "color") %>% 
+  gt::grand_summary_rows(columns = !style, fns = "sum") %>% 
+  gt::sub_missing()
+
+clean_df_tshirts %>% 
+  group_by(discount) %>% 
+  summarise(n = sum(n))
 ```
 

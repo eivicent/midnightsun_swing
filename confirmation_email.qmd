@@ -1,0 +1,170 @@
+---
+title: "Untitled"
+format: html
+---
+
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+ss <- "https://docs.google.com/spreadsheets/d/18wAjNf2iROcjmqxMbuCYYjPOIsXcY4FxOzKBwyR_ZqU/edit#gid=1969315070"
+```
+
+```{r EMAIL}
+img_string <- add_image(file = "~/GitHub/midnightsun_swing/midnightsunswing.jpeg")
+
+confirmation_text <- function(your_information){
+  
+  str_glue("**Welcome to Midnight Sun Swing - 1st Edition!**
+
+We hope that you are as thrilled as we are to spend a fantastic summer weekend in Helsinki with a lot of classes and two nights of non-stop dancing! 
+
+Here you have all the information needed:
+
+**Your information:**
+
+{your_information}
+
+
+**Classes Information:**
+
+-   Each Lindy Hop group will have 4 classes of 75 min
+    -   **Sonia & Hector** classes will always be at [Hietsun Paviljonki](https://maps.app.goo.gl/bxYwcnodgNHN8E6W7)
+    -   **Skye & Frida** classes will always be at [Helsinki German School](https://maps.app.goo.gl/mKZVPrhF6hZWwYhk7)
+    
+-   **Solo Jazz** will have 2 classes of 90 min at [Hietsun Paviljonki](https://maps.app.goo.gl/bxYwcnodgNHN8E6W7)
+
+-   **Blues** will have 2 classes of 90 min at [Hietsun Paviljonki](https://maps.app.goo.gl/bxYwcnodgNHN8E6W7)
+
+- Doors will open 15 min before the classes start
+
+**[SCHEDULE HERE](https://drive.google.com/drive/folders/1uX69bfDvXTJR9_LCQ0VOpHnrTf_yqSyd)**
+
+**Parties Information:**
+
+-   Friday and Saturday parties will happen at [Hietsun Paviljonki](https://maps.app.goo.gl/bxYwcnodgNHN8E6W7)
+
+-   **NEW!** On Friday, the party will start at **19.30h with an amazing open class to all participants by Skye and Frida**, where we will get to watch and dance to an old clip selected by them.
+
+-   On Saturday, the party will start at 20.30h so you can all get a longer rest after classes ;)
+
+- Both days we will have 3 sets of live band and parties will go until 1.30h, doors will open 30 min before the party starts
+
+-   On Sunday we will party from 17:30h onwards at [Design museum](https://maps.app.goo.gl/BeeFZA7PVijCzVah8), open to everyone
+
+**Pre-parties information:**
+
+There will be 2 parties happening in Helsinki organised by the local communities where you will be able to find us
+
+-   On Tuesday 11th at [Comets in the Park](https://www.facebook.com/events/426613396824605/426613400157938/?acontext=%7B%22event_action_history%22%3A%5B%7B%22surface%22%3A%22home%22%7D%2C%7B%22mechanism%22%3A%22surface%22%2C%22surface%22%3A%22permalink%22%7D%5D%2C%22ref_notif_type%22%3Anull%7D)
+-   On Thursday 13th June at [Blues Dance Summer](https://www.facebook.com/events/1186017119239604)
+
+**Registration**
+
+You need to check-in before your first class to get your wristband (and a T-shirt if you ordered one). It can be done:
+
+-   During pre-parties
+
+-   On Friday 14th June, from 17h for those attending Solo Jazz or from 19h for those attending the open class.
+
+-   On Saturday 16th June, 15 min before the classes or from 20h at the party venue
+
+**Other information:**
+
+-   The entrance to Hietsu will be on the beach side during the parties
+
+-   There will be a coffee corner, where we will sell coffee and snacks, but you are allowed to bring your own!
+
+-   **We recommend you bring a refillable water bottle with you, and (maybe) swimsuit and towel for the #midnightsunswim**
+
+**Social Media**
+
+-   Remember to follow us on social media and to share your memories with us! [@midnightsunswing](https://www.instagram.com/midnightsun_swing/)
+
+**Code of conduct and safe space**
+
+-   We want to make this weekend safe and enjoyable for everyone and we expect that you will follow the [code of conduct](https://www.midnightsunswing.fi/code-of-conduct/) of our Helsinki scene and act respectfully to everyone
+
+-   If you need advice or come across any unwanted behaviour you can contact any of the organisers personally or via [email](midnightsunswing@gmail.com) or call our safe space person April Karkulahti (+358505231534)
+
+-   There will be a photographer in the event and the photos taken may be published on our social media and used to promote our future events. If you do not wish to appear in any of the photos please let us know during the weekend
+
+We wish everyone a joyful and unforgettable festival weekend!
+
+If you have any further questions don’t hesitate to reach us by email, Facebook or Instagram.
+
+Cheers from the Midnight Sun Swing Team
+
+{img_string}"
+  )
+}
+
+generate_email_details_confirmation <- function(level, role, extra, tshirt_answer) {
+  str_glue("- Your group: **{level}**
+    - Your extra: **{dplyr::coalesce(extra, '-')}**
+    - T-shirt: **{dplyr::coalesce(tshirt_answer, '-')}**")
+}
+```
+
+
+```{r DATA PREP}
+adva_leaders <- read_sheet(ss, sheet = "Adv - A",range = "A:F")
+adva_followers <- read_sheet(ss, sheet = "Adv - A",range = "G:L")
+advb_leaders <- read_sheet(ss, sheet = "Adv - B",range = "A:F")
+advb_followers <- read_sheet(ss, sheet = "Adv - B",range = "G:L")
+intermediate_leaders <- read_sheet(ss, sheet = "Intermediate",range = "A:F")
+intermediate_followers <- read_sheet(ss, sheet = "Intermediate",range = "G:L")
+party_people <- read_sheet(ss, sheet = "Party")
+
+out <- adva_leaders %>% mutate(group = "Advanced A",
+                        role = "Leader") %>% 
+  union(adva_followers %>% mutate(group = "Advanced A",
+                                  role = "Follower")) %>% 
+  union(advb_leaders %>% mutate(group = "Advanced B",
+                                role = "Leader")) %>% 
+  union(advb_followers %>% mutate(group = "Advanced B",
+                                  role = "Follower")) %>% 
+  union(intermediate_leaders %>% mutate(group = "Intemediate",
+                                        role = "Leader")) %>% 
+  union(intermediate_followers %>% mutate(group = "Intermediate",
+                                          role = "Follower")) %>% 
+  union(party_people %>% mutate(group = "Party Pass",
+                                role = "Party"))
+```
+
+
+```{r DATA PREP}
+out <- out %>% filter(name == "Catherine")
+
+for(ii in 1:nrow(out)) {
+  email <- confirmation_text(
+    generate_email_details_confirmation(out[ii,]$group,  
+                                        out[ii,]$role, 
+                                        out[ii,]$extra, 
+                                        out[ii,]$tshirt))
+
+  email_to_send <- compose_email(
+    body = md(email),
+    title = "Welcome to Midnight Sun Swing",
+    footer = "Midnight Sun Swing"
+    )
+  
+  email_to_send_with_attachments <- add_attachment(
+    email_to_send,
+    file = "Schedule mobile.pdf",content_type = "pdf"
+  ) %>% add_attachment(file = "Schedule.pdf", content_type = "pdf")
+
+
+  smtp_send(
+  email_to_send_with_attachments,
+  to = out[ii,]$email,
+  from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  subject = "Information - Midnight Sun Swing",
+  credentials = creds_file(file = "~/gmail_creds")
+  )
+  cat(ii, "/", nrow(out), "\n")
+}
+
+```
+
