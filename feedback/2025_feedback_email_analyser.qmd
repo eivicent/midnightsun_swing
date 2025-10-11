@@ -1,0 +1,355 @@
+---
+title: "2025_feedback_email_analyser"
+format: html
+---
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+library(scales)
+library(ellmer)
+library(gt)
+
+gs4_auth(email = "vicent.boned.11@gmail.com")
+chat <- chat_ollama(model = "llama3.1:8b", seed = 123)
+```
+
+
+```{r DATA PROCESSING}
+colnames <- c("timestamp", "name", "participation", "classes_rate", "classes_why", 
+              "parties_rate", "parties_why", "worth_money_rate", "worth_money_why", 
+              "open_feedback", "future_ideas")
+df2025 <-read_sheet(ss = "https://docs.google.com/spreadsheets/d/1w6gBzV0NJi6RcpKAMWE7SGR-px_B9Oo6lNQmZywSbuY/edit?gid=1456259706#gid=1456259706") %>%
+  mutate(edition = 2025)
+df2024 <- read_sheet(ss = "https://docs.google.com/spreadsheets/d/1s9dERJcK3UEk9UQdaHYOyVW-SE2_zgwCjUCU79o4mS4/edit?gid=1407248365#gid=1407248365") %>% 
+  mutate(edition = 2024)
+
+names(df2024) <- c(colnames, "edition")
+names(df2025) <- c(colnames, "edition")
+
+all_feedback <- df2024 %>% union(df2025) %>%
+  mutate(
+    lindy_intermediate = str_detect(participation, "Lindy Hop Intermediate(?! / Advanced)"),
+    lindy_advanced = str_detect(participation, "Lindy Hop Advanced"),
+    lindy_int_adv = str_detect(participation, "Lindy Hop Intermediate / Advanced"),
+    solo_jazz = str_detect(participation, "Solo Jazz"),
+    balboa_a = str_detect(participation, "Balboa A \\(Advanced\\)"),
+    balboa_b = str_detect(participation, "Balboa B \\(Intermediate\\)"),
+    blues = str_detect(participation,"Blues")
+  )
+
+all_feedback_by_level <- all_feedback %>% 
+  # filter(edition == 2025) %>% 
+  pivot_longer(names_to = "level", values_to = "levelatt", cols = lindy_intermediate:blues) %>% 
+  filter(levelatt)
+```
+
+
+```{r AVERAGE RATING TABLE}
+all_feedback %>% 
+  select(edition, classes_rate, parties_rate) %>%
+  pivot_longer(cols = !edition) %>% 
+  group_by(edition, name) %>% 
+  summarise(rate = mean(value)) %>% 
+  pivot_wider(names_from = name, values_from = rate) %>% 
+  gt(groupname_col = NULL)
+```
+
+```{r RATING OF CLASSES BY LEVEL}
+# CLASSES RATING COMPARISON
+all_feedback %>% 
+  group_by(edition, classes_rate) %>% 
+  summarise(r = n()) %>% 
+  ggplot(aes(x = as.character(edition),
+             y = r,
+             fill = as.factor(classes_rate))) +
+  geom_col(position = "fill", color = "black") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Classes Rating Comparison", 
+       x = "Edition", 
+       y = "Percentage",
+       fill = "Rating") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "#94D3BE"),
+        title = element_text(color = "#458A73", face = "bold"),
+        panel.grid.major.x =  element_blank()) +
+  scale_fill_viridis_d()
+
+# Classes rating by level for 2025
+all_feedback_by_level %>% 
+  group_by(level, edition) %>% 
+  summarise(avg_response = mean(classes_rate, na.rm = TRUE),
+            responses = n()) %>%
+  ggplot(aes(x = level,
+             y = avg_response)) +
+  geom_col(fill = "#458A73") +
+  coord_flip(ylim = c(3,5)) +
+  geom_text(aes(label = label_number(accuracy = .1)(avg_response)), 
+            hjust = -1) + 
+  geom_text(aes(label = paste0("n: ",responses), y = 3.5)) +
+  labs(title = "Average Class Ratings by Level", x = NULL, y = "Average Rating") +
+  theme_minimal() +
+  facet_wrap(vars(edition)) +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.grid.major.x = element_line(colour = "#458A73"),
+        plot.background = element_rect(fill = "#94D3BE"),
+        title = element_text(color = "#458A73",face = "bold"),
+        panel.background = element_rect(fill = "#94D3BE"))
+
+```
+
+```{r CLASSES AI ANALYSIS}
+# AI ANALYSIS OF CLASSES FEEDBACK
+classes_feedback_2024 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2024, !is.na(classes_why)) %>%
+    filter(classes_why != "") %>%
+    select(aux = classes_why) %>%
+    pluck("aux"), collapse = "T"))
+)
+
+classes_feedback_2025 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2025, !is.na(classes_why)) %>%
+    filter(classes_why != "") %>%
+    select(aux = classes_why) %>%
+    pluck("aux"), collapse = "T"))
+)
+
+```
+
+```{r RATING PARTIES CHART}
+all_feedback %>% 
+  group_by(edition, parties_rate) %>% 
+  summarise(r = n()) %>% 
+  ggplot(aes(x = as.character(edition),
+             y = r,
+             fill = as.factor(parties_rate))) +
+  geom_col(position = "fill", color = "black") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Parties Rating Comparison", 
+       x = "Edition", 
+       y = "Percentage",
+       fill = "Rating") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "#94D3BE"),
+        title = element_text(color = "#458A73", face = "bold"),
+        panel.grid.major.x =  element_blank()) +
+  scale_fill_viridis_d()
+```
+
+
+```{r PARTIES AI ANALYSIS}
+# AI ANALYSIS OF PARTIES FEEDBACK
+parties_feedback_2024 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2024, !is.na(parties_why)) %>%
+    filter(parties_why != "") %>%
+    select(aux = parties_why) %>%
+    pluck("aux"), collapse = "T"))
+)
+
+parties_feedback_2025 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2025, !is.na(parties_why)) %>%
+    filter(parties_why != "") %>%
+    select(aux = parties_why) %>%
+    pluck("aux"), collapse = "T"))
+)
+```
+
+
+```{r WORTH MONEY CHART}
+# WORTH MONEY RATING COMPARISON
+all_feedback %>% 
+  group_by(edition, worth_money_rate) %>% 
+  summarise(r = n()) %>% 
+  ggplot(aes(x = as.character(edition),
+             y = r,
+             fill = worth_money_rate)) +
+  geom_col(position = "fill", color = "black") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Worth Money Rating Comparison", 
+       x = "Edition", 
+       y = "Percentage",
+       fill = "Rating") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "#94D3BE"),
+        title = element_text(color = "#458A73", face = "bold")) +
+  ggthemes::scale_fill_fivethirtyeight()
+```
+
+```{r WORTH AI ANALYSIS}
+# AI ANALYSIS OF WORTH MONEY FEEDBACK
+worth_feedback_2024 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2024, !is.na(worth_money_rate)) %>%
+    filter(worth_money_rate != "") %>%
+    select(aux = worth_money_rate) %>%
+    pluck("aux"), collapse = "T"))
+)
+
+worth_feedback_2025 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2025, !is.na(worth_money_rate)) %>%
+    filter(worth_money_rate != "") %>%
+    select(aux = worth_money_rate) %>%
+    pluck("aux"), collapse = "T"))
+)
+```
+
+```{r OPEN FEEDBACK AI ANALYSIS}
+# OVERALL FEEDBACK ANALYSIS
+
+overall_feedback_2024 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2024, !is.na(open_feedback)) %>%
+    filter(open_feedback != "") %>%
+    select(aux = open_feedback) %>%
+    pluck("aux"), collapse = "T"))
+)
+
+overall_feedback_2025 <- chat$chat(paste0("
+Summarise the whole feedback in 3 positive points and 3 negative points \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2025, !is.na(open_feedback)) %>%
+    filter(open_feedback != "") %>%
+    select(aux = open_feedback) %>%
+    pluck("aux"), collapse = "T"))
+)
+```
+
+```{r FUTURE IDEAS AI ANALYSIS}
+# FUTURE IDEAS ANALYSIS
+
+future_ideas_2024 <- chat$chat(paste0("
+Summarise the whole list of ideas in 3 ideas \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2024, !is.na(future_ideas)) %>%
+    filter(future_ideas != "") %>%
+    select(aux = future_ideas) %>%
+    pluck("aux"), collapse = "T"))
+)
+
+future_ideas_2025 <- chat$chat(paste0("
+Summarise the whole list of ideas in 3 ideas \n \n",
+paste0(
+  all_feedback %>%
+    filter(edition == 2025, !is.na(future_ideas)) %>%
+    filter(future_ideas != "") %>%
+    select(aux = future_ideas) %>%
+    pluck("aux"), collapse = "T"))
+)
+```
+
+```{r}
+# COMPREHENSIVE COMPARISON ANALYSIS
+comparison_analysis <- chat$chat(
+  paste0(
+    "Based on the following feedback data, provide a comprehensive comparison between 2024 and 2025 editions:\n\n",
+    "2024 Classes Feedback: ", classes_feedback_2024, "\n\n",
+    "2025 Classes Feedback: ", classes_feedback_2025, "\n\n",
+    "2024 Parties Feedback: ", parties_feedback_2024, "\n\n", 
+    "2025 Parties Feedback: ", parties_feedback_2025, "\n\n",
+    "2024 Worth Money Feedback: ", worth_feedback_2024, "\n\n",
+    "2025 Worth Money Feedback: ", worth_feedback_2025, "\n\n",
+    "2024 Overall Feedback: ", overall_feedback_2024, "\n\n",
+    "2025 Overall Feedback: ", overall_feedback_2025, "\n\n",
+    "2024 Future Ideas: ", future_ideas_2024, "\n\n",
+    "2025 Future Ideas: ", future_ideas_2025, "\n\n",
+    "Please provide:\n",
+    "1. What went well in 2024 vs 2025\n",
+    "2. What went badly in 2024 vs 2025\n", 
+    "3. Key differences and improvements between editions\n",
+    "4. Overall recommendations for future editions"
+  )
+)
+```
+
+## Results Summary
+
+### Classes Feedback Analysis
+
+**2024 Classes Feedback:**
+```{r}
+classes_feedback_2024
+```
+
+**2025 Classes Feedback:**
+```{r}
+classes_feedback_2025
+```
+
+### Parties Feedback Analysis
+
+**2024 Parties Feedback:**
+```{r}
+parties_feedback_2024
+```
+
+**2025 Parties Feedback:**
+```{r}
+parties_feedback_2025
+```
+
+### Worth Money Analysis
+
+**2024 Worth Money Feedback:**
+```{r}
+worth_feedback_2024
+```
+
+**2025 Worth Money Feedback:**
+```{r}
+worth_feedback_2025
+```
+
+### Overall Feedback Analysis
+
+**2024 Overall Feedback:**
+```{r}
+overall_feedback_2024
+```
+
+**2025 Overall Feedback:**
+```{r}
+overall_feedback_2025
+```
+
+### Future Ideas Analysis
+
+**2024 Future Ideas:**
+```{r}
+future_ideas_2024
+```
+
+**2025 Future Ideas:**
+```{r}
+future_ideas_2025
+```
+
+## Comprehensive Comparison
+
+```{r}
+comparison_analysis
+```
+
+
