@@ -1,0 +1,67 @@
+---
+title: "MSS 2026 - Update Registration"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+rm(list = ls())
+library(dplyr)
+library(stringr)
+library(here)
+
+source(here::here("R", "config.R"))
+source(here::here("R", "firestore_api.R"))
+```
+
+## Define Updates
+
+Add one row per update: the Firestore **document ID**, the **field** to change,
+and the new **value** to set.
+
+```{r}
+#| label: define-updates
+
+updates <- tribble(
+  ~id,                        ~field,             ~value,
+  "KSlx5Aj6No1BeUuS3QJG",            "partner_email",    "tonjebsen22@hotmail.com"
+  
+)
+
+# Normalise email values
+updates <- updates |>
+  mutate(value = if_else(
+    field %in% c("email", "partner_email"),
+    str_to_lower(str_trim(value)),
+    str_trim(value)
+  ))
+
+updates |> knitr::kable()
+```
+
+## Apply Changes
+
+Set `eval: true` once you have reviewed the updates above and are ready to push
+them to Firestore.
+
+```{r}
+#| label: apply-changes
+#| eval: false
+
+stopifnot(nrow(updates) > 0)
+
+for (i in seq_len(nrow(updates))) {
+  row <- updates[i, ]
+  cat("Updating doc", row$id, "->", row$field, ":", row$value, "\n")
+
+  fields <- setNames(list(row$value), row$field)
+  fn_update_registration(doc_id = row$id, fields = fields)
+}
+
+cat("\nDone! Updated", nrow(updates), "registration(s).\n")
+```

@@ -1,0 +1,374 @@
+---
+title: "2025 Feedback Email Analyzer"
+format: 
+  html:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    code_folding: show
+    css: |
+      .main-container {
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+      .section-header {
+        background: linear-gradient(135deg, #458A73, #94D3BE);
+        color: white;
+        padding: 15px 20px;
+        border-radius: 8px;
+        margin: 30px 0 20px 0;
+        font-size: 1.5em;
+        font-weight: bold;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      }
+      .subsection-header {
+        background: #94D3BE;
+        color: #458A73;
+        padding: 10px 15px;
+        border-radius: 5px;
+        margin: 20px 0 15px 0;
+        font-size: 1.2em;
+        font-weight: bold;
+      }
+      .analysis-box {
+        background: #f8f9fa;
+        border-left: 4px solid #458A73;
+        padding: 15px;
+        margin: 15px 0;
+        border-radius: 0 5px 5px 0;
+      }
+      .chart-container {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        margin: 15px 0;
+      }
+---
+
+```{r setup}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+library(scales)
+library(ellmer)
+library(gt)
+library(here)
+
+# Authentication and AI setup
+gs4_auth(email = "vicent.boned.11@gmail.com")
+chat <- chat_ollama(model = "llama3.1:8b", seed = 123)
+```
+
+```{r functions}
+# Reusable function for AI analysis
+analyze_feedback <- function(data, edition, feedback_column, analysis_type = "feedback") {
+  feedback_text <- data %>%
+    filter(edition == !!edition, !is.na(!!sym(feedback_column))) %>%
+    filter(!!sym(feedback_column) != "") %>%
+    select(aux = !!sym(feedback_column)) %>%
+    pluck("aux") %>%
+    paste0(collapse = " ")
+  
+  if (analysis_type == "feedback") {
+    prompt <- paste0("Summarise the whole feedback in 3 positive points and 3 negative points \n \n", feedback_text)
+  } else if (analysis_type == "ideas") {
+    prompt <- paste0("Summarise the whole list of ideas in 3 ideas \n \n", feedback_text)
+  }
+  
+  chat$chat(prompt)
+}
+
+# Function to create rating comparison chart
+create_rating_chart <- function(data, rate_column, title, subtitle = "") {
+  data %>% 
+    group_by(edition, !!sym(rate_column)) %>% 
+    summarise(r = n(), .groups = "drop") %>% 
+    ggplot(aes(x = as.character(edition),
+               y = r,
+               fill = as.factor(!!sym(rate_column)))) +
+    geom_col(position = "fill", color = "black") +
+    scale_y_continuous(labels = label_percent()) +
+    labs(title = title, 
+         subtitle = subtitle,
+         x = "Edition", 
+         y = "Percentage",
+         fill = "Rating") +
+    theme_minimal() +
+    theme(plot.background = element_rect(fill = "#94D3BE"),
+          title = element_text(color = "#458A73", face = "bold"),
+          panel.grid.major.x = element_blank()) +
+    scale_fill_viridis_d()
+}
+
+# Function to create classes rating by level chart
+create_level_rating_chart <- function(data) {
+  data %>% 
+    group_by(level, edition) %>% 
+    summarise(avg_response = mean(classes_rate, na.rm = TRUE),
+              responses = n(), .groups = "drop") %>%
+    ggplot(aes(x = level, y = avg_response)) +
+    geom_col(fill = "#458A73") +
+    coord_flip(ylim = c(3,5)) +
+    geom_text(aes(label = label_number(accuracy = .1)(avg_response)), 
+              hjust = -1) + 
+    geom_text(aes(label = paste0("n: ", responses), y = 3.5)) +
+    labs(title = "Average Class Ratings by Level", x = NULL, y = "Average Rating") +
+    theme_minimal() +
+    facet_wrap(vars(edition)) +
+    theme(panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(colour = "#458A73"),
+          plot.background = element_rect(fill = "#94D3BE"),
+          title = element_text(color = "#458A73", face = "bold"),
+          panel.background = element_rect(fill = "#94D3BE"))
+}
+```
+
+```{r data-processing}
+# Define column names
+colnames <- c("timestamp", "name", "participation", "classes_rate", "classes_why", 
+              "parties_rate", "parties_why", "worth_money_rate", "worth_money_why", 
+              "open_feedback", "future_ideas")
+
+# Load data from Google Sheets
+df2025 <- read_sheet(ss = "https://docs.google.com/spreadsheets/d/1w6gBzV0NJi6RcpKAMWE7SGR-px_B9Oo6lNQmZywSbuY/edit?gid=1456259706#gid=1456259706") %>%
+  mutate(edition = 2025)
+
+df2024 <- read_sheet(ss = "https://docs.google.com/spreadsheets/d/1s9dERJcK3UEk9UQdaHYOyVW-SE2_zgwCjUCU79o4mS4/edit?gid=1407248365#gid=1407248365") %>% 
+  mutate(edition = 2024)
+
+# Standardize column names
+names(df2024) <- c(colnames, "edition")
+names(df2025) <- c(colnames, "edition")
+
+# Combine and process data
+all_feedback <- df2024 %>% 
+  union(df2025) %>%
+  mutate(
+    lindy_intermediate = str_detect(participation, "Lindy Hop Intermediate(?! / Advanced)"),
+    lindy_advanced = str_detect(participation, "Lindy Hop Advanced"),
+    lindy_int_adv = str_detect(participation, "Lindy Hop Intermediate / Advanced"),
+    solo_jazz = str_detect(participation, "Solo Jazz"),
+    balboa_a = str_detect(participation, "Balboa A \\(Advanced\\)"),
+    balboa_b = str_detect(participation, "Balboa B \\(Intermediate\\)"),
+    blues = str_detect(participation, "Blues")
+  )
+
+# Create level-based analysis dataset
+all_feedback_by_level <- all_feedback %>% 
+  pivot_longer(names_to = "level", values_to = "levelatt", cols = lindy_intermediate:blues) %>% 
+  filter(levelatt)
+```
+
+# Executive Summary
+
+```{r summary-table}
+# Create summary table of average ratings
+all_feedback %>% 
+  select(edition, classes_rate, parties_rate, worth_money_rate) %>%
+  pivot_longer(cols = !edition) %>% 
+  group_by(edition, name) %>% 
+  summarise(rate = mean(value, na.rm = TRUE), .groups = "drop") %>% 
+  pivot_wider(names_from = name, values_from = rate) %>% 
+  gt(groupname_col = NULL) %>%
+  tab_header(title = "Average Ratings by Edition") %>%
+  fmt_number(columns = everything(), decimals = 2)
+```
+
+# Classes Analysis {.section-header}
+
+## Classes Rating Comparison
+
+```{r classes-rating-chart}
+# Classes rating comparison chart
+create_rating_chart(all_feedback, "classes_rate", "Classes Rating Comparison", "Percentage distribution across editions")
+```
+
+## Classes Rating by Level
+
+```{r classes-level-chart}
+# Classes rating by level
+create_level_rating_chart(all_feedback_by_level)
+```
+
+## Classes Feedback Analysis
+
+```{r classes-ai-analysis}
+# AI analysis of classes feedback
+classes_feedback_2024 <- analyze_feedback(all_feedback, 2024, "classes_why")
+classes_feedback_2025 <- analyze_feedback(all_feedback, 2025, "classes_why")
+```
+
+### 2024 Classes Feedback
+<div class="analysis-box">
+```{r}
+classes_feedback_2024
+```
+</div>
+
+### 2025 Classes Feedback
+<div class="analysis-box">
+```{r}
+classes_feedback_2025
+```
+</div>
+
+# Parties Analysis {.section-header}
+
+## Parties Rating Comparison
+
+```{r parties-rating-chart}
+# Parties rating comparison chart
+create_rating_chart(all_feedback, "parties_rate", "Parties Rating Comparison", "Percentage distribution across editions")
+```
+
+## Parties Feedback Analysis
+
+```{r parties-ai-analysis}
+# AI analysis of parties feedback
+parties_feedback_2024 <- analyze_feedback(all_feedback, 2024, "parties_why")
+parties_feedback_2025 <- analyze_feedback(all_feedback, 2025, "parties_why")
+```
+
+### 2024 Parties Feedback
+<div class="analysis-box">
+```{r}
+parties_feedback_2024
+```
+</div>
+
+### 2025 Parties Feedback
+<div class="analysis-box">
+```{r}
+parties_feedback_2025
+```
+</div>
+
+# Value for Money Analysis {.section-header}
+
+## Worth Money Rating Comparison
+
+```{r worth-money-chart}
+# Worth money rating comparison chart
+all_feedback %>% 
+  group_by(edition, worth_money_rate) %>% 
+  summarise(r = n(), .groups = "drop") %>% 
+  ggplot(aes(x = as.character(edition),
+             y = r,
+             fill = worth_money_rate)) +
+  geom_col(position = "fill", color = "black") +
+  scale_y_continuous(labels = label_percent()) +
+  labs(title = "Worth Money Rating Comparison", 
+       subtitle = "Percentage distribution across editions",
+       x = "Edition", 
+       y = "Percentage",
+       fill = "Rating") +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "#94D3BE"),
+        title = element_text(color = "#458A73", face = "bold")) +
+  ggthemes::scale_fill_fivethirtyeight()
+```
+
+## Worth Money Feedback Analysis
+
+```{r worth-money-ai-analysis}
+# AI analysis of worth money feedback
+worth_feedback_2024 <- analyze_feedback(all_feedback, 2024, "worth_money_why")
+worth_feedback_2025 <- analyze_feedback(all_feedback, 2025, "worth_money_why")
+```
+
+### 2024 Worth Money Feedback
+<div class="analysis-box">
+```{r}
+worth_feedback_2024
+```
+</div>
+
+### 2025 Worth Money Feedback
+<div class="analysis-box">
+```{r}
+worth_feedback_2025
+```
+</div>
+
+# Overall Feedback Analysis {.section-header}
+
+## Open Feedback Analysis
+
+```{r overall-feedback-ai-analysis}
+# AI analysis of overall feedback
+overall_feedback_2024 <- analyze_feedback(all_feedback, 2024, "open_feedback")
+overall_feedback_2025 <- analyze_feedback(all_feedback, 2025, "open_feedback")
+```
+
+### 2024 Overall Feedback
+<div class="analysis-box">
+```{r}
+overall_feedback_2024
+```
+</div>
+
+### 2025 Overall Feedback
+<div class="analysis-box">
+```{r}
+overall_feedback_2025
+```
+</div>
+
+## Future Ideas Analysis
+
+```{r future-ideas-ai-analysis}
+# AI analysis of future ideas
+future_ideas_2024 <- analyze_feedback(all_feedback, 2024, "future_ideas", "ideas")
+future_ideas_2025 <- analyze_feedback(all_feedback, 2025, "future_ideas", "ideas")
+```
+
+### 2024 Future Ideas
+<div class="analysis-box">
+```{r}
+future_ideas_2024
+```
+</div>
+
+### 2025 Future Ideas
+<div class="analysis-box">
+```{r}
+future_ideas_2025
+```
+</div>
+
+# Comprehensive Comparison {.section-header}
+
+```{r comprehensive-comparison}
+# Comprehensive comparison analysis
+comparison_analysis <- chat$chat(
+  paste0(
+    "Based on the following feedback data, provide a comprehensive comparison between 2024 and 2025 editions:\n\n",
+    "2024 Classes Feedback: ", classes_feedback_2024, "\n\n",
+    "2025 Classes Feedback: ", classes_feedback_2025, "\n\n",
+    "2024 Parties Feedback: ", parties_feedback_2024, "\n\n", 
+    "2025 Parties Feedback: ", parties_feedback_2025, "\n\n",
+    "2024 Worth Money Feedback: ", worth_feedback_2024, "\n\n",
+    "2025 Worth Money Feedback: ", worth_feedback_2025, "\n\n",
+    "2024 Overall Feedback: ", overall_feedback_2024, "\n\n",
+    "2025 Overall Feedback: ", overall_feedback_2025, "\n\n",
+    "2024 Future Ideas: ", future_ideas_2024, "\n\n",
+    "2025 Future Ideas: ", future_ideas_2025, "\n\n",
+    "Please provide:\n",
+    "1. What went well in 2024 vs 2025\n",
+    "2. What went badly in 2024 vs 2025\n", 
+    "3. Key differences and improvements between editions\n",
+    "4. Overall recommendations for future editions"
+  )
+)
+```
+
+## Key Findings and Recommendations
+
+<div class="analysis-box">
+```{r}
+comparison_analysis
+```
+</div>

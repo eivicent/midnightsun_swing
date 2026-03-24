@@ -1,0 +1,887 @@
+---
+title: "MSS 2026 Registration Processing"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+rm(list = ls())
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(here)
+library(googlesheets4)
+
+source(here::here("R", "config.R"))
+source(here::here("R", "firestore_api.R"))
+
+# Fixed timestamp for the entire run — ensures hold-period logic is deterministic
+# within a single execution (no drift from Sys.time() called at different points)
+RUN_TIMESTAMP <- Sys.time()
+cat("Run timestamp:", format(RUN_TIMESTAMP, "%Y-%m-%d %H:%M:%S %Z"), "\n")
+```
+
+## Load Registrations from Firebase
+
+```{r}
+#| label: load-data
+
+df_raw <- fn_get_registrations(filters = list(pass = c("lindy", "lindy_solo")))
+write_sheet(df_raw, ss = GOOGLE_SHEETS$registrations_2026, "raw_data")
+```
+
+## Load Previous State (for idempotency & state-diff)
+
+```{r}
+#| label: load-previous-state
+
+# Try to read the previous final_tally from Google Sheets.
+# This is the source of truth for who was already CONFIRMED / WAITLIST / ON_HOLD.
+# If it doesn't exist yet (first run), we start with an empty frame.
+prev_tally <- tryCatch(
+  read_sheet(GOOGLE_SHEETS$registrations_2026, sheet = "final_tally"),
+  error = function(e) {
+    message("No previous final_tally found — first run.")
+    tibble(
+      email        = character(),
+      prev_status  = character(),
+      prev_lindy_in = logical(),
+      prev_solo_in  = logical()
+    )
+  }
+)
+
+# Keep only the columns we need for comparison
+if (nrow(prev_tally) > 0 && "status" %in% names(prev_tally)) {
+  prev_tally <- prev_tally |>
+    select(
+      email,
+      prev_status   = status,
+      prev_lindy_in = any_of("lindy_in"),
+      prev_solo_in  = any_of("solo_in")
+    ) |>
+    mutate(
+      # Coalesce logicals to FALSE (not status, which is character)
+      across(any_of(c("prev_lindy_in", "prev_solo_in")), ~ coalesce(as.logical(.), FALSE)),
+      prev_status = coalesce(prev_status, "UNKNOWN")
+    )
+} else {
+  prev_tally <- tibble(
+    email         = character(),
+    prev_status   = character(),
+    prev_lindy_in = logical(),
+    prev_solo_in  = logical()
+  )
+}
+
+cat("Previous tally rows:", nrow(prev_tally), "\n")
+```
+
+## Clean and Prepare Data
+
+```{r}
+#| label: clean-data
+
+# Firebase schema columns:
+# name, email, pass, role, partner_email, level, created_at, 
+# payment_status, amount_cents, id, stripe_* fields
+
+df_clean <- df_raw |>
+  filter(!is.na(email) & email != "") |> 
+  filter(pass %in% c("lindy","lindy_solo")) %>% 
+  mutate(
+    created_at = as.POSIXct(created_at),
+    name = str_to_title(name),
+    email = str_to_lower(email),
+    partner_email = str_to_lower(coalesce(partner_email, "")),
+    level = str_to_lower(level),
+    # Detect which passes they registered for from 'pass' field
+    # 2026: Lindy, Lindy + Solo
+    lindy = str_detect(pass, regex("lindy", ignore_case = TRUE)),
+    solo = str_detect(pass, regex("solo", ignore_case = TRUE)),
+    # Standardize partner field (guard against partner_email == own email)
+    partner_email = if_else(partner_email == email, "", partner_email),
+    has_partner = partner_email != "" & !is.na(partner_email)
+  ) |>
+  arrange(created_at) %>% 
+  # Deduplicate: keep the latest registration per email
+
+  # (handles re-submissions; latest row has the most up-to-date preferences)
+  group_by(email) |>
+  slice_max(created_at, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(-c(stripe_payment_method_id)) %>% 
+  relocate(created_at, id, email, name, pass, role, level, has_partner, partner_email) %>% 
+  arrange(created_at)
+
+# Report duplicates removed
+n_before_dedup <- df_raw |> filter(!is.na(email) & email != "", pass %in% c("lindy","lindy_solo")) |> nrow()
+cat("Registrations before dedup:", n_before_dedup,
+    "| after dedup:", nrow(df_clean),
+    "| removed:", n_before_dedup - nrow(df_clean), "duplicates\n")
+
+# Show pass distribution
+df_clean |> count(role, level) %>% 
+  pivot_wider(names_from = role, values_from = n, values_fill = 0)
+
+write_sheet(df_clean, ss = GOOGLE_SHEETS$registrations_2026, "clean_data")
+```
+
+## Define Quotas
+
+```{r}
+#| label: quotas
+
+# Quotas derived from the single source of truth in config.R → GROUP_CAPACITIES
+LINDY_QUOTAS <- tibble(
+  level = c("intermediate", "int-advanced", "advanced"),
+  quota = c(
+    GROUP_CAPACITIES$intermediate,
+    GROUP_CAPACITIES$intermediate_advanced,
+    GROUP_CAPACITIES$advanced
+  )
+)
+
+SOLO_QUOTA <- GROUP_CAPACITIES$solo
+
+# Hold period: days to wait for a listed partner to register before treating as single
+PARTNER_HOLD_DAYS <- 3
+
+cat("Lindy quotas:\n")
+print(LINDY_QUOTAS)
+cat("Solo quota:", SOLO_QUOTA, "\n")
+cat("Hold period:", PARTNER_HOLD_DAYS, "days\n")
+```
+
+## Helper Functions for Matching
+
+```{r}
+#| label: helper-functions
+
+#' Match leaders and followers for a dance track
+#' 
+#' @param df Data frame with registrations for a specific track
+#' @param quota_df Data frame with level and quota columns (or single number for all levels)
+#' @param hold_days Number of days to hold a spot for an unmatched partner before
+#'   treating the registrant as a single. 0 = no hold (immediate single matching).
+#' @param run_ts Fixed timestamp for this run (avoids Sys.time() drift)
+#' @param prev_pairs Optional tibble of ALL pairs from the previous run.
+#'   Eligible pairs are locked: their members are removed from matching pools
+#'   and they receive priority pair_numbers so they can never be pushed out
+#'   of the quota by new registrations.
+#' @return List with `pairs` (matched pairs with eligibility) and `on_hold`
+#'   (registrants still waiting for their partner within the hold period)
+fn_match_partners <- function(df, quota_df, hold_days = 0,
+                              run_ts = RUN_TIMESTAMP,
+                              prev_pairs = NULL) {
+  
+  # Separate leaders and followers
+  leaders <- df |>
+    filter(role == "leader") |>
+    select(created_at, email, level, has_partner, partner_email)
+  
+  followers <- df |>
+    filter(role == "follower") |>
+    select(created_at, email, level, has_partner, partner_email)
+  
+  # ── Step 0: Lock ALL previously eligible pairs (couples + singles) ──
+  # Locked pairs keep their spots unconditionally. Their members are removed
+  # from the matching pools so they cannot be re-matched or displaced.
+  if (!is.null(prev_pairs) && nrow(prev_pairs) > 0) {
+    locked_pairs <- prev_pairs |> filter(eligible)
+    locked_emails <- c(
+      locked_pairs$email_leader[!is.na(locked_pairs$email_leader)],
+      locked_pairs$email_follower[!is.na(locked_pairs$email_follower)]
+    )
+    # Remove locked people from ALL pools (before couple matching + singles)
+    leaders   <- leaders   |> filter(!email %in% locked_emails)
+    followers <- followers |> filter(!email %in% locked_emails)
+    
+    cat("  Locked", nrow(locked_pairs), "previously eligible pairs (",
+        sum(locked_pairs$is_couple), "couples,",
+        sum(!locked_pairs$is_couple), "singles pairs )\n")
+  } else {
+    locked_pairs <- NULL
+  }
+  
+  # ── Step 1: Match registered couples (mutual partner reference + same level) ──
+  # Only runs on the REMAINING (non-locked) leaders and followers.
+  couples <- leaders |>
+    filter(has_partner) |>
+    inner_join(
+      followers |> filter(has_partner),
+      by = c("partner_email" = "email", "level" = "level"),
+      suffix = c("_leader", "_follower")
+    ) |>
+    filter(email == partner_email_follower) |>
+    select(
+      email_leader = email,
+      email_follower = partner_email,
+      level,
+      created_at_leader,
+      created_at_follower
+    ) |>
+    mutate(is_couple = TRUE)
+  
+  # ── Step 2: Unmatched partners (listed partner didn't register / different level) ──
+  unmatched_leaders <- leaders |>
+    filter(has_partner) |>
+    anti_join(couples, by = c("email" = "email_leader"))
+  
+  unmatched_followers <- followers |>
+    filter(has_partner) |>
+    anti_join(couples, by = c("email" = "email_follower"))
+  
+  # ── Step 2b: Hold period (uses fixed run_ts, NOT Sys.time()) ──
+  if (hold_days > 0) {
+    hold_cutoff <- run_ts - as.difftime(hold_days, units = "days")
+    
+    on_hold_leaders   <- unmatched_leaders  |> filter(created_at > hold_cutoff)
+    expired_leaders   <- unmatched_leaders  |> filter(created_at <= hold_cutoff)
+    on_hold_followers <- unmatched_followers |> filter(created_at > hold_cutoff)
+    expired_followers <- unmatched_followers |> filter(created_at <= hold_cutoff)
+    
+    on_hold <- bind_rows(
+      on_hold_leaders   |> mutate(role = "leader"),
+      on_hold_followers |> mutate(role = "follower")
+    )
+  } else {
+    expired_leaders   <- unmatched_leaders
+    expired_followers <- unmatched_followers
+    on_hold <- tibble(
+      created_at    = as.POSIXct(character()),
+      email         = character(),
+      level         = character(),
+      has_partner   = logical(),
+      partner_email = character(),
+      role          = character()
+    )
+  }
+  
+  # ── Step 3: Build singles pool (true singles + expired unmatched partners) ──
+  single_leaders <- leaders |>
+    filter(!has_partner) |>
+    bind_rows(expired_leaders |> select(-partner_email)) |>
+    arrange(created_at)
+  
+  single_followers <- followers |>
+    filter(!has_partner) |>
+    bind_rows(expired_followers |> select(-partner_email)) |>
+    arrange(created_at)
+  
+  # ── Step 3b: Match new singles by index within each level ──
+  single_leaders <- single_leaders |>
+    group_by(level) |> arrange(created_at) |> mutate(idx = row_number()) |> ungroup()
+  single_followers <- single_followers |>
+    group_by(level) |> arrange(created_at) |> mutate(idx = row_number()) |> ungroup()
+  
+  non_couples <- single_leaders |>
+    full_join(single_followers, by = c("idx", "level"), suffix = c("_leader", "_follower")) |>
+    select(email_leader, email_follower, level, created_at_leader, created_at_follower) |>
+    mutate(is_couple = FALSE)
+  
+  # ── Step 4: Combine new couples + new singles into "new_pairs" ──
+  new_pairs <- bind_rows(couples, non_couples) |>
+    mutate(
+      created_at_pair = pmax(created_at_leader, created_at_follower, na.rm = TRUE),
+      is_locked = FALSE
+    )
+  
+  # ── Step 5: Combine locked + new, number with locked pairs first ──
+  # Locked pairs get priority pair_numbers (sorted by their original created_at_pair).
+  # New pairs are appended after, so they can only fill remaining quota slots.
+  if (!is.null(locked_pairs) && nrow(locked_pairs) > 0) {
+    locked_for_combine <- locked_pairs |>
+      mutate(
+        created_at_pair = pmax(created_at_leader, created_at_follower, na.rm = TRUE),
+        is_locked = TRUE
+      ) |>
+      select(email_leader, email_follower, level,
+             created_at_leader, created_at_follower,
+             is_couple, created_at_pair, is_locked)
+    
+    all_pairs <- bind_rows(locked_for_combine, new_pairs)
+  } else {
+    all_pairs <- new_pairs
+  }
+  
+  # Number pairs: locked first (preserving their order), then new by created_at_pair
+  all_pairs <- all_pairs |>
+    group_by(level) |>
+    arrange(!is_locked,
+            is.na(email_leader) | is.na(email_follower),
+            created_at_pair,
+            .by_group = TRUE) |>
+    mutate(pair_number = row_number()) |>
+    ungroup()
+  
+  # Apply quotas: locked pairs are ALWAYS eligible; new pairs fill remaining slots
+  if (is.data.frame(quota_df)) {
+    all_pairs <- all_pairs |>
+      left_join(quota_df, by = "level") |>
+      mutate(
+        eligible = is_locked |
+          (pair_number <= quota &
+           !is.na(email_leader) & !is.na(email_follower))
+      )
+  } else {
+    all_pairs <- all_pairs |>
+      mutate(
+        quota = quota_df,
+        eligible = is_locked |
+          (pair_number <= quota &
+           !is.na(email_leader) & !is.na(email_follower))
+      )
+  }
+  
+  list(pairs = all_pairs, on_hold = on_hold)
+}
+
+#' Convert paired data to individual eligibility
+#' 
+#' @param pairs_df Data frame with matched pairs
+#' @param track_name Name of the track (for column naming)
+#' @return Data frame with email and eligibility status
+fn_pairs_to_individual <- function(pairs_df, track_name) {
+  col_name <- paste0(track_name, "_in")
+  
+  pairs_df |>
+    select(email_leader, email_follower, eligible) |>
+    pivot_longer(
+      cols = c(email_leader, email_follower),
+      names_to = "role",
+      values_to = "email"
+    ) |>
+    filter(!is.na(email)) |>
+    # Collapse to one row per email; eligible if ANY pair grants eligibility
+    group_by(email) |>
+    summarise(!!col_name := any(eligible), .groups = "drop")
+}
+```
+
+## Process Lindy Hop Registrations
+
+```{r}
+#| label: lindy-processing
+
+df_lindy <- df_clean |>
+  filter(lindy) |>
+  select(created_at, email, role, level, has_partner, partner_email)
+
+# Load ALL previous pairs from Google Sheets (if they exist).
+# fn_match_partners handles locking internally (filters eligible pairs itself).
+prev_lindy_pairs <- tryCatch(
+  read_sheet(GOOGLE_SHEETS$registrations_2026, sheet = "lindy_pairs_locked"),
+  error = function(e) {
+    message("No previous lindy_pairs_locked sheet — first run.")
+    NULL
+  }
+)
+
+# Match partners for Lindy (passing previous pairs for stability)
+lindy_result <- fn_match_partners(
+  df_lindy,
+  quota_df  = LINDY_QUOTAS,
+  hold_days = PARTNER_HOLD_DAYS,
+  run_ts    = RUN_TIMESTAMP,
+  prev_pairs = prev_lindy_pairs
+)
+lindy_pairs   <- lindy_result$pairs
+lindy_on_hold <- lindy_result$on_hold
+
+# Summary by level
+lindy_summary <- lindy_pairs |>
+  group_by(level) |>
+  summarise(
+    complete_pairs = sum(!is.na(email_leader) & !is.na(email_follower)),
+    eligible_pairs = sum(eligible, na.rm = TRUE),
+    quota = first(quota),
+    .groups = "drop"
+  )
+
+print(lindy_summary)
+
+# Get individual eligibility
+lindy_eligible <- fn_pairs_to_individual(lindy_pairs, "lindy")
+
+# ── Monotonic safety net: never demote a previously confirmed lindy participant ──
+# Even if pair-locking covers most cases, this guarantees lindy_in can only go
+# from FALSE → TRUE, never TRUE → FALSE across re-runs.
+if (nrow(prev_tally) > 0) {
+  lindy_before <- lindy_eligible  # snapshot before overlay
+  lindy_eligible <- lindy_eligible |>
+    left_join(prev_tally |> select(email, prev_lindy_in), by = "email") |>
+    mutate(lindy_in = coalesce(lindy_in, FALSE) | coalesce(prev_lindy_in, FALSE)) |>
+    select(email, lindy_in)
+  
+  # Count people who would have been demoted without this safety net
+  n_saved <- sum(lindy_eligible$lindy_in & !coalesce(lindy_before$lindy_in, FALSE))
+  if (n_saved > 0) {
+    cat("  ⚠ Monotonic safety net saved", n_saved, "lindy participants from demotion\n")
+  }
+}
+
+# Persist locked-in pairs for next run (source of truth for stability)
+write_sheet(lindy_pairs, ss = GOOGLE_SHEETS$registrations_2026, sheet = "lindy_pairs_locked")
+```
+
+## Process Solo Jazz Registrations
+
+```{r}
+#| label: solo-processing
+
+# Solo doesn't require partner matching, just queue-entry order.
+# Eligibility depends on being accepted in Lindy (if registered for both).
+#
+# Queue ordering: a person joins the Solo queue at the moment they become
+# Lindy-eligible, NOT at the moment they registered. This prevents someone
+# who registered early but was on the Lindy waitlist from displacing a person
+# who has been confirmed for Solo since an earlier run.
+#
+# Tier 0 – not registered for Lindy at all (eligible from registration)
+# Tier 1 – already Lindy-confirmed in the previous run (eligible since then)
+# Tier 2 – newly Lindy-confirmed this run (join end of queue)
+#
+# Within each tier, order is by created_at (first-come, first-served).
+
+df_solo <- df_clean |>
+  filter(solo) |>
+  select(created_at, email) |>
+  # Join with lindy eligibility to check if they're in
+  left_join(lindy_eligible, by = "email") |>
+  left_join(
+    df_clean |> select(email, lindy) |> distinct(),
+    by = "email"
+  ) |>
+  # Bring in previous Lindy status to determine queue tier
+  left_join(
+    if (nrow(prev_tally) > 0) {
+      prev_tally |> select(email, prev_lindy_in)
+    } else {
+      tibble(email = character(), prev_lindy_in = logical())
+    },
+    by = "email"
+  ) |>
+  mutate(
+    # Can participate in solo if:
+    # - Not registered for lindy, OR
+    # - Registered for lindy AND accepted
+    can_queue_solo = !lindy | (lindy & coalesce(lindy_in, FALSE)),
+
+    # Queue tier determines sort priority (see note above)
+    solo_queue_tier = case_when(
+      !coalesce(lindy, FALSE)          ~ 0L,  # Solo-only: eligible from registration
+      coalesce(prev_lindy_in, FALSE)   ~ 1L,  # Already Lindy-confirmed last run
+      TRUE                             ~ 2L   # Newly Lindy-confirmed this run
+    )
+  ) |>
+  arrange(solo_queue_tier, created_at) |>
+  mutate(
+    # queue_position only counts people who *can* queue.
+    # People blocked by Lindy waitlist should NOT consume a queue slot.
+    queue_position = cumsum(can_queue_solo),
+    solo_in = can_queue_solo & queue_position <= SOLO_QUOTA
+  )
+
+solo_summary <- df_solo |>
+  summarise(
+    total_registrations = n(),
+    can_queue = sum(can_queue_solo),
+    eligible = sum(solo_in, na.rm = TRUE),
+    quota = SOLO_QUOTA
+  )
+
+cat("\n=== SOLO SUMMARY ===\n")
+print(solo_summary)
+
+cat("\n=== SOLO QUEUE BY TIER ===\n")
+df_solo |>
+  group_by(solo_queue_tier) |>
+  summarise(
+    description = case_when(
+      first(solo_queue_tier) == 0L ~ "Solo-only registrants",
+      first(solo_queue_tier) == 1L ~ "Previously Lindy-confirmed",
+      TRUE                         ~ "Newly Lindy-confirmed this run"
+    ),
+    total = n(),
+    can_queue = sum(can_queue_solo),
+    solo_in = sum(solo_in, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  print()
+
+solo_eligible <- df_solo |>
+  select(email, solo_in)
+
+# ── Monotonic safety net: never demote a previously confirmed solo participant ──
+if (nrow(prev_tally) > 0) {
+  solo_before <- solo_eligible  # snapshot before overlay
+  solo_eligible <- solo_eligible |>
+    left_join(prev_tally |> select(email, prev_solo_in), by = "email") |>
+    mutate(solo_in = coalesce(solo_in, FALSE) | coalesce(prev_solo_in, FALSE)) |>
+    select(email, solo_in)
+  
+  n_saved <- sum(solo_eligible$solo_in & !coalesce(solo_before$solo_in, FALSE))
+  if (n_saved > 0) {
+    cat("  ⚠ Monotonic safety net saved", n_saved, "solo participants from demotion\n")
+  }
+}
+```
+
+## Final Tally - Combine All Results
+
+```{r}
+#| label: final-tally
+
+# Create on-hold indicator from lindy processing
+lindy_on_hold_emails <- if (nrow(lindy_on_hold) > 0) {
+  lindy_on_hold |> distinct(email) |> mutate(is_on_hold = TRUE)
+} else {
+  tibble(email = character(), is_on_hold = logical())
+}
+
+# Combine all eligibility results
+final_tally <- df_clean |>
+  select(
+    id, created_at, email, name, pass, role, level,
+    lindy, solo,
+    has_partner, partner_email,
+    payment_status, amount_cents
+  ) |>
+  left_join(lindy_eligible, by = "email") |>
+  left_join(solo_eligible, by = "email") |>
+  left_join(lindy_on_hold_emails, by = "email") |>
+  mutate(
+    # Determine overall status
+    status = case_when(
+      # On hold - waiting for partner to register within hold period
+      coalesce(is_on_hold, FALSE) ~ "ON_HOLD",
+      
+      # All registered tracks are accepted
+      (is.na(lindy) | !lindy | coalesce(lindy_in, FALSE)) &
+      (is.na(solo) | !solo | coalesce(solo_in, FALSE)) &
+      (coalesce(lindy_in, FALSE) | coalesce(solo_in, FALSE)) ~ "CONFIRMED",
+      
+      # At least one track accepted, others on waitlist
+      coalesce(lindy_in, FALSE) | coalesce(solo_in, FALSE) ~ "PARTIAL",
+      
+      # No tracks accepted
+      TRUE ~ "WAITLIST"
+    )
+  )
+
+# Sanity check: final_tally must have exactly one row per email
+dup_emails <- final_tally |> count(email) |> filter(n > 1)
+if (nrow(dup_emails) > 0) {
+  warning("DUPLICATE EMAILS in final_tally: ", paste(dup_emails$email, collapse = ", "))
+}
+stopifnot("final_tally has duplicate emails!" = nrow(dup_emails) == 0)
+
+# Status summary
+status_summary <- final_tally |>
+  count(status) |>
+  arrange(desc(n))
+
+cat("\n=== FINAL STATUS SUMMARY ===\n")
+print(status_summary)
+
+# Detailed breakdown
+cat("\n=== DETAILED BREAKDOWN ===\n")
+final_tally |>
+  group_by(status) |>
+  summarise(
+    count = n(),
+    lindy_in = sum(lindy_in, na.rm = TRUE),
+    solo_in = sum(solo_in, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  print()
+```
+
+## State Diff — Previous vs New
+
+```{r}
+#| label: state-diff
+
+# Compare current results against previous run to identify transitions
+# This is the key output when re-running: who changed status?
+
+if (nrow(prev_tally) > 0) {
+  state_diff <- final_tally |>
+    select(email, name, role, level, status, lindy_in, solo_in) |>
+    left_join(prev_tally, by = "email", suffix = c("", "_prev")) |>
+    mutate(
+      prev_status  = coalesce(prev_status, "NEW"),
+      status_changed = status != prev_status,
+      transition = if_else(
+        status_changed,
+        paste0(prev_status, " -> ", status),
+        "no change"
+      )
+    )
+  
+  # ── People who improved (Waitlist/On Hold → Confirmed/Partial) ──
+  promotions <- state_diff |>
+    filter(
+      status_changed,
+      prev_status %in% c("WAITLIST", "ON_HOLD", "PARTIAL", "NEW"),
+      status %in% c("CONFIRMED", "PARTIAL")
+    ) |>
+    select(name, email, role, level, transition)
+  
+  cat("\n=== PROMOTIONS (need confirmation email) ===\n")
+  if (nrow(promotions) > 0) {
+    print(promotions, n = 100)
+  } else {
+    cat("No promotions since last run.\n")
+  }
+  
+  # ── People whose status worsened (should not happen with locking) ──
+  demotions <- state_diff |>
+    filter(
+      status_changed,
+      prev_status %in% c("CONFIRMED", "PARTIAL"),
+      status %in% c("WAITLIST", "ON_HOLD")
+    ) |>
+    select(name, email, role, level, transition)
+  
+  if (nrow(demotions) > 0) {
+    cat("\n⚠ WARNING: DEMOTIONS DETECTED (should not happen!) ===\n")
+    print(demotions, n = 100)
+  }
+  
+  # ── New registrations (not in previous run) ──
+  new_regs <- state_diff |>
+    filter(prev_status == "NEW") |>
+    select(name, email, role, level, status)
+  
+  cat("\n=== NEW REGISTRATIONS SINCE LAST RUN ===\n")
+  if (nrow(new_regs) > 0) {
+    print(new_regs, n = 100)
+  } else {
+    cat("No new registrations.\n")
+  }
+  
+  # ── Full transition summary ──
+  cat("\n=== TRANSITION SUMMARY ===\n")
+  state_diff |>
+    count(transition) |>
+    arrange(desc(n)) |>
+    print()
+  
+} else {
+  cat("First run — no previous state to compare against.\n")
+}
+```
+
+## Write Lindy Levels to Google Sheets
+
+```{r}
+#| label: write-levels-to-sheets
+
+# Join names and payment_status onto lindy_pairs for display
+lindy_pairs_display <- lindy_pairs |>
+  left_join(df_clean |> select(email, name, payment_status), by = c("email_leader" = "email")) |>
+  rename(leader_name = name, payment_status_leader = payment_status) |>
+  left_join(df_clean |> select(email, name, payment_status), by = c("email_follower" = "email")) |>
+  rename(follower_name = name, payment_status_follower = payment_status) |>
+  mutate(
+    leader_paid = coalesce(str_to_lower(payment_status_leader) == "captured" | str_detect(str_to_lower(payment_status_leader), "paid"), FALSE),
+    follower_paid = coalesce(str_to_lower(payment_status_follower) == "captured" | str_detect(str_to_lower(payment_status_follower), "paid"), FALSE)
+  ) |>
+  select(level, pair_number, leader_name, leader_email = email_leader, leader_paid,
+         created_at_leader,
+         follower_name, follower_email = email_follower, follower_paid,
+         is_couple, eligible, created_at_follower) |>
+  arrange(level, pair_number)
+
+# Define sheet names per level
+levels_to_write <- list(
+  "Lindy Advanced"     = "advanced",
+  "Lindy Int-Adv"      = "int-advanced",
+  "Lindy Intermediate"  = "intermediate"
+)
+
+# Write each level to its own sheet with a summary header
+for (sheet_name in names(levels_to_write)) {
+  lvl <- levels_to_write[[sheet_name]]
+  lvl_data <- lindy_pairs_display |> filter(level == lvl) |> select(-level)
+  quota_val <- LINDY_QUOTAS |> filter(level == lvl) |> pull(quota)
+
+  complete    <- sum(!is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
+  no_leader   <- sum(is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
+  no_follower <- sum(!is.na(lvl_data$leader_email) & is.na(lvl_data$follower_email))
+  spots_left  <- max(0, quota_val - complete)
+
+  # Summary block (written to rows 1-2)
+  summary_df <- tibble(
+    Metric = c("Quota", "Complete pairs", "Missing leaders", "Missing followers", "Spots left"),
+    Value  = c(quota_val, complete, no_leader, no_follower, spots_left)
+  )
+
+  # Write summary first (creates/overwrites the sheet)
+  write_sheet(summary_df, ss = GOOGLE_SHEETS$registrations_2026, sheet = sheet_name)
+  # Append pairs table starting at row 4 (leaving a blank row separator)
+  range_write(lvl_data, ss = GOOGLE_SHEETS$registrations_2026, sheet = sheet_name, range = "A4")
+
+  cat("Written sheet:", sheet_name, "—", complete, "complete pairs,", spots_left, "spots left\n")
+}
+```
+
+## Write Solo Jazz to Google Sheets
+
+```{r}
+#| label: write-solo-to-sheets
+
+solo_display <- final_tally |>
+  filter(coalesce(solo, FALSE)) |>
+  left_join(
+    df_solo |> select(email, solo_queue_tier, queue_position),
+    by = "email"
+  ) |>
+  mutate(
+    paid = coalesce(
+      str_to_lower(payment_status) == "captured" |
+        str_detect(str_to_lower(coalesce(payment_status, "")), "paid"),
+      FALSE
+    ),
+    solo_status = if_else(coalesce(solo_in, FALSE), "Confirmed", "Waitlist"),
+    queue_tier_label = case_when(
+      solo_queue_tier == 0L ~ "Solo-only",
+      solo_queue_tier == 1L ~ "Prev. Lindy-confirmed",
+      TRUE                  ~ "Newly Lindy-confirmed"
+    )
+  ) |>
+  arrange(solo_status, queue_position) |>
+  select(
+    solo_status, queue_position,
+    name, email, role, level,
+    paid, created_at,
+    queue_tier_label
+  )
+
+confirmed_count <- sum(coalesce(solo_display$solo_status == "Confirmed", FALSE))
+waitlist_count  <- sum(coalesce(solo_display$solo_status == "Waitlist",  FALSE))
+spots_left      <- max(0L, SOLO_QUOTA - confirmed_count)
+
+solo_summary_df <- tibble(
+  Metric = c("Quota", "Confirmed", "Waitlist", "Spots left"),
+  Value  = c(SOLO_QUOTA, confirmed_count, waitlist_count, spots_left)
+)
+
+write_sheet(solo_summary_df, ss = GOOGLE_SHEETS$registrations_2026, sheet = "Solo Jazz")
+range_write(
+  solo_display,
+  ss    = GOOGLE_SHEETS$registrations_2026,
+  sheet = "Solo Jazz",
+  range = "A4"
+)
+
+cat("Written sheet: Solo Jazz —", confirmed_count, "confirmed,",
+    waitlist_count, "waitlisted,", spots_left, "spots left\n")
+```
+
+## Waitlist Details
+
+```{r}
+#| label: waitlist-details
+
+# Show people on waitlist with reasons
+waitlist <- final_tally |>
+  filter(status %in% c("WAITLIST", "PARTIAL")) |>
+  mutate(
+    waitlist_for = case_when(
+      lindy & !coalesce(lindy_in, FALSE) & solo & !coalesce(solo_in, FALSE) ~ "Lindy + Solo",
+      lindy & !coalesce(lindy_in, FALSE) ~ "Lindy",
+      solo & !coalesce(solo_in, FALSE) ~ "Solo",
+      TRUE ~ "Unknown"
+    )
+  ) |>
+  select(name, email, status, waitlist_for, level, role, has_partner, partner_email)
+
+# Show on-hold registrations (waiting for partner within hold period)
+on_hold <- final_tally |>
+  filter(status == "ON_HOLD") |>
+  select(name, email, level, role, partner_email, created_at) |>
+  mutate(
+    hold_expires = created_at + as.difftime(PARTNER_HOLD_DAYS, units = "days")
+  )
+
+cat("\n=== ON HOLD (partner has", PARTNER_HOLD_DAYS, "days to register) ===\n")
+if (nrow(on_hold) > 0) {
+  print(on_hold, n = 50)
+} else {
+  cat("No registrations currently on hold.\n")
+}
+
+cat("\n=== WAITLIST DETAILS ===\n")
+print(waitlist, n = 50)
+```
+
+## Persist Final Tally (source of truth for next run)
+
+```{r}
+#| label: persist-final-tally
+
+# Write the final_tally to Google Sheets so the NEXT run can use it as
+# "previous state" for the state-diff and for locking in confirmed results.
+write_sheet(final_tally, ss = GOOGLE_SHEETS$registrations_2026, sheet = "final_tally")
+cat("Final tally written to Google Sheets (", nrow(final_tally), "rows)\n")
+cat("Run completed at:", format(RUN_TIMESTAMP, "%Y-%m-%d %H:%M:%S %Z"), "\n")
+```
+
+## Update Firebase with Results (Optional)
+
+```{r}
+#| label: update-firebase
+#| eval: false
+
+# Only update Firebase for registrations whose status, lindy_in, or solo_in
+# have changed since the last run (or are brand-new registrations).
+
+changed <- final_tally |>
+  select(id, email, status, lindy_in, solo_in) |>
+  left_join(prev_tally, by = "email") |>
+  mutate(
+    prev_status   = coalesce(prev_status, "NEW"),
+    prev_lindy_in = coalesce(prev_lindy_in, FALSE),
+    prev_solo_in  = coalesce(prev_solo_in, FALSE),
+    cur_lindy_in  = coalesce(lindy_in, FALSE),
+    cur_solo_in   = coalesce(solo_in, FALSE)
+  ) |>
+  filter(
+    status       != prev_status |
+    cur_lindy_in != prev_lindy_in |
+    cur_solo_in  != prev_solo_in
+  )
+
+cat("Registrations to update:", nrow(changed), "of", nrow(final_tally), "total\n\n")
+
+if (nrow(changed) == 0) {
+  cat("Nothing to update — Firebase is already in sync.\n")
+} else {
+  for (i in seq_len(nrow(changed))) {
+    reg <- changed[i, ]
+
+    fn_update_registration(
+      doc_id = reg$id,
+      fields = list(
+        lindy_in = reg$cur_lindy_in,
+        solo_in  = reg$cur_solo_in,
+        status   = reg$status
+      )
+    )
+
+    cat("Updated:", reg$email, "—", reg$prev_status, "->", reg$status,
+        " | lindy_in:", reg$cur_lindy_in, "| solo_in:", reg$cur_solo_in, "\n")
+    Sys.sleep(0.5)  # Rate limiting
+  }
+
+  cat("\nFirebase update complete!", nrow(changed), "registrations updated.\n")
+}
+```

@@ -1,0 +1,277 @@
+---
+title: "groups_summary"
+format: html
+---
+
+```{r LIBRARIES}
+library(googlesheets4)
+library(tidyverse)
+```
+
+```{r READ SHEET}
+rm(list = ls())
+gs4_auth(email = "vicent.boned.11@gmail.com")
+responses_2025 <- "https://docs.google.com/spreadsheets/d/1SeBYtYHBqXbiMc3HsSY7Y5kSSMDBp1SE8xZIm9_qJig/edit?usp=drive_web&ouid=112595747830863843103"
+responses_df <- googlesheets4::read_sheet(responses_2025,sheet = "Form responses 1")
+```
+
+```{r CLEAN GROUPS DF}
+clean_groups_df <- responses_df %>% 
+  mutate(balboa_role = coalesce(`What is your dance role in Balboa?...7`,
+                         `What is your dance role in Balboa?...9`),
+         balboa_level = coalesce(`What is your Balboa level?...10`, 
+                                  `What is your Balboa level?...8`),
+         balboa = str_detect(`Which dance pass would you like to choose?`, "Balboa|Full Week Pass"),
+         lindy = str_detect(`Which dance pass would you like to choose?`, "Lindy|Full Week Pass"),
+         solo = str_detect(`Which dance pass would you like to choose?`, "Solo|Full Week Pass")
+         ) %>% 
+  select(-c(`What is your Balboa level?...10`,
+            `What is your Balboa level?...8`,
+            `What is your dance role in Balboa?...7`,
+            `What is your dance role in Balboa?...9`,
+            `I agree with participation terms`)) %>% 
+  mutate(`Timestamp` = if_else(`Email address` == "egarcia24fs@gmail.com", as.POSIXct("2025-02-11 22:48:07 UTC"), `Timestamp`)) %>% 
+  arrange(`Timestamp`)
+
+names(clean_groups_df) <- c("timestamp", "email",
+                            "name", "lastname",
+                            "country", "pass", 
+                            "lindy_role","lindy_level",
+                            "partner", "partner_name", "partner_email",
+                            "tshirt", "tshirt_size",
+                            "volunteer",
+                            "balboa_role", "balboa_level",
+                            "balboa", "lindy", "solo")
+
+sheet_write(clean_groups_df, ss = responses_2025, sheet = "clean_groups_df")
+```
+
+```{r WRITE GROUPS SUMMARY}
+balboa_summary_df <- clean_groups_df %>%
+  filter(balboa) %>% 
+  group_by(balboa_role, balboa_level) %>% 
+  summarise(attendees = n())  %>% 
+  pivot_wider(names_from = balboa_role, values_from = attendees) 
+
+googlesheets4::range_write(ss = responses_2025,
+                           data = balboa_summary_df,
+                           sheet = "Reg summary",
+                           range = "A2", reformat = F)
+
+lindy_summary_df <- clean_groups_df %>%
+  filter(lindy) %>% 
+  group_by(lindy_role, lindy_level) %>% 
+  summarise(attendees = n())  %>% 
+  pivot_wider(names_from = lindy_role, values_from = attendees) 
+
+googlesheets4::range_write(ss = responses_2025,
+                           data = lindy_summary_df,
+                           sheet = "Reg summary",
+                           range = "E2", reformat = F)
+
+solo_summary_df <- clean_groups_df %>%
+  filter(solo) %>% 
+  summarise(attendees = n())
+
+googlesheets4::range_write(ss = responses_2025,
+                           data = solo_summary_df,
+                           sheet = "Reg summary",
+                           range = "I2", reformat = F)
+```
+
+```{r LINDY GROUPS}
+quota_lookup <- tibble(
+  level = c("Intermediate", "Intermediate - Advanced", "Advanced"),
+  quota = c(22, 24, 45)
+)
+
+aux_lindy <- clean_groups_df %>% 
+  filter(lindy) %>% 
+  select(timestamp, email, lindy_role, lindy_level, partner, partner_email) %>%
+  mutate(ig = row_number(), .by = c(lindy_role, lindy_level))
+
+couples <- full_join(
+            filter(aux_lindy, lindy_role == "Leader", partner == "Yes"),
+            filter(aux_lindy, lindy_role == "Follower", partner == "Yes"),
+            by = c("email" = "partner_email",
+                   "lindy_level" = "lindy_level"), 
+            suffix = c("_leaders","_followers")
+            ) %>% 
+  select(-c(lindy_role_leaders, lindy_role_followers,
+            partner_leaders, partner_followers)) %>% 
+  rename(email_leaders = email,
+         partner_email_leaders = partner_email) 
+  # select(-lindy_level_followers)
+
+
+remove_leaders_couples <- couples %>% 
+  filter(is.na(email_followers)) %>% 
+  left_join(select(clean_groups_df, email, balboa, partner), 
+            by = c("partner_email_leaders" = "email")) %>% 
+  mutate(partner_email_leaders = if_else(balboa & partner == "Yes" | is.na(partner), partner_email_leaders, NA))
+
+remove_followers_couples <- couples %>% 
+  filter(is.na(partner_email_leaders)) %>% 
+  left_join(select(clean_groups_df, email, balboa, partner),
+      by = c("email_leaders" = "email")) %>% 
+  mutate(email_leaders = if_else(balboa & partner == "Yes" | is.na(partner), email_leaders, NA))
+
+couples_update <- couples %>% anti_join(remove_leaders_couples, by = "email_leaders") %>% 
+  anti_join(remove_followers_couples, by = c("email_followers"))
+
+remove_from_couples <- remove_leaders_couples %>% mutate(partner = "No", partner_email = NA) %>% 
+  select(email = email_leaders, partner, partner_email) %>% 
+  union( remove_followers_couples %>% mutate(partner = "No", partner_email_leaders = NA) %>% 
+           select(email = email_followers, partner, partner_email = partner_email_leaders))
+
+aux_lindy <- aux_lindy %>% rows_update(y = remove_from_couples, by = "email")
+
+non_couples <- 
+  full_join(filter(aux_lindy, lindy_role == "Leader", partner == "No") %>% 
+              mutate(index_partner = row_number(), 
+                     .by = c(lindy_role, lindy_level, partner)),
+            filter(aux_lindy, lindy_role == "Follower", partner == "No") %>% 
+                            mutate(index_partner = row_number(), 
+                     .by = c(lindy_role, lindy_level, partner)),
+            by = c("index_partner", 
+                   "lindy_level"), suffix = c("_leaders", "_followers")) %>% 
+  select(-c(index_partner,partner_email_followers,
+            lindy_role_leaders, lindy_role_followers,
+            partner_leaders, partner_followers
+            ))
+
+output_lindy <- union(couples_update, non_couples) %>% 
+    mutate(timecouple = pmax(timestamp_leaders, timestamp_followers)) %>% 
+    group_by(lindy_level) %>% 
+    arrange(timecouple) %>% 
+    mutate(couple_number = row_number()) %>% 
+    left_join(quota_lookup, by = c("lindy_level" = "level")) %>%
+    mutate(elegible_in = couple_number <= quota & 
+             !is.na(email_leaders) & !is.na(email_followers)
+           )
+  
+output_lindy %>% 
+  filter(lindy_level == "Advanced") %>% 
+  write_sheet(ss = responses_2025,
+              sheet = "Lindy_Advanced2")
+
+output_lindy %>% 
+  filter(lindy_level == "Intermediate - Advanced") %>% 
+  write_sheet(ss = responses_2025,
+              sheet = "Lindy Int - Adv2")
+
+output_lindy %>% 
+  filter(lindy_level == "Intermediate") %>% 
+  write_sheet(ss = responses_2025,
+              sheet = "Lindy Int2")
+
+lindy_elegible <- output_lindy %>%
+  select(email_leaders, email_followers, elegible_in) %>% 
+  pivot_longer(names_to = "role", values_to = "email", cols = contains("email")) %>% 
+  select(email, lindy_in = elegible_in) %>% 
+  filter(!is.na(email))
+```
+
+```{r BALBOA GROUPS}
+aux_balboa <- clean_groups_df %>% 
+  filter(balboa) %>% 
+  select(timestamp, email, balboa_role, balboa_level, partner, partner_email) %>% 
+  mutate(partner_email = if_else(email == "paula.borkowski@gmail.com",
+                                 "aarontamny@gmail.com", partner_email))
+
+couples <- full_join(
+            filter(aux_balboa, balboa_role == "Leader", partner == "Yes"),
+            filter(aux_balboa, balboa_role == "Follower", partner == "Yes"),
+            by = c("email" = "partner_email"),relationship = "many-to-many",
+            suffix = c("_leaders","_followers")
+            ) %>% 
+  select(-c(balboa_role_leaders, balboa_role_followers,
+            partner_leaders, partner_followers)) %>% 
+  rename(email_leaders = email,
+         balboa_level = balboa_level_leaders,
+         partner_email_leaders = partner_email) %>% 
+  select(-balboa_level_followers)
+
+remove_leaders_couples <- couples %>% 
+  filter(is.na(email_followers)) %>% 
+  left_join(select(clean_groups_df, email, balboa, partner), 
+            by = c("partner_email_leaders" = "email")) %>% 
+  mutate(partner_email_leaders = if_else(balboa & partner == "Yes" | is.na(partner), partner_email_leaders, NA))
+
+remove_followers_couples <- couples %>% 
+  filter(is.na(partner_email_leaders)) %>% 
+  left_join(select(clean_groups_df, email, balboa, partner),
+      by = c("email_leaders" = "email")) %>% 
+  mutate(email_leaders = if_else(balboa & partner == "Yes" | is.na(partner), email_leaders, NA))
+
+couples_update <- couples %>% anti_join(remove_leaders_couples, by = "email_leaders") %>% 
+  anti_join(remove_followers_couples, by = "email_followers")
+
+remove_from_couples <- remove_leaders_couples %>% mutate(partner = "No", partner_email = NA) %>% 
+  select(email = email_leaders, partner, partner_email) %>% 
+  union( remove_followers_couples %>% mutate(partner = "No", partner_email_leaders = NA) %>% 
+           select(email = email_followers, partner, partner_email = partner_email_leaders))
+
+aux_balboa <- aux_balboa %>% rows_update(y = remove_from_couples, by = "email")
+
+non_couples <- 
+  full_join(filter(aux_balboa, balboa_role == "Leader", partner == "No") %>% 
+              mutate(index_partner = row_number(), .by = c(balboa_role, balboa_level, partner)),
+            filter(aux_balboa, balboa_role == "Follower", partner == "No") %>% 
+              mutate(index_partner = row_number(), .by = c(balboa_role, balboa_level, partner)),
+            by = c("index_partner", 
+                   "balboa_level"), suffix = c("_leaders", "_followers")) %>% 
+  select(-c(index_partner,partner_email_followers,
+            balboa_role_leaders, balboa_role_followers,
+            partner_leaders, partner_followers
+            ))
+
+output_balboa <- union(couples_update, non_couples) %>% 
+    mutate(timecouple = pmax(timestamp_leaders, timestamp_followers)) %>% 
+    arrange(timecouple) %>% 
+    mutate(couple_number = row_number()) %>%
+    mutate(elegible_in = couple_number <= 44 & 
+             !is.na(email_leaders) & !is.na(email_followers)
+           )
+
+balboa_elegible <- output_balboa %>% ungroup() %>% 
+  select(email_leaders, email_followers, elegible_in) %>% 
+  pivot_longer(names_to = "role", values_to = "email", cols = contains("email")) %>% 
+  select(email, balboa_in = elegible_in) %>% 
+  filter(!is.na(email))
+  
+output_balboa %>% 
+  write_sheet(ss = responses_2025,
+              sheet = "Balboa2")
+```
+
+```{r SOLO GROUPS}
+aux_solo <- clean_groups_df %>% 
+  filter(solo) %>% 
+  select(timestamp, email) %>% 
+  left_join(select(ungroup(output_lindy), email_leaders, email_followers, elegible_in, timecouple) %>% 
+              pivot_longer(names_to = "role", values_to = "email", cols = !c(timecouple, elegible_in)) %>% 
+              select(-role)) %>%
+  arrange(coalesce(timecouple,timestamp)) %>% 
+  mutate(elegible_in = if_else(email == "Brittanycarr4087@gmail.com", T,elegible_in)) %>% 
+  mutate(solo_in = row_number() <= 40 & elegible_in) 
+
+output_solo <- aux_solo 
+
+solo_elegible  <- output_solo %>% select(-timecouple, -timestamp, -elegible_in) 
+  
+output_solo %>% 
+  write_sheet(ss = responses_2025,
+              sheet = "Solo Jazz2")
+```
+
+```{r FINAL TALLY}
+confirmations <- lindy_elegible %>% 
+  full_join(solo_elegible, by = "email") %>%
+  full_join(balboa_elegible, by ="email") %>% 
+  full_join(select(clean_groups_df, email, lindy, balboa, solo),
+            by = "email") %>% 
+  unique()
+
+confirmations %>%  write_sheet(ss = responses_2025, sheet = "final_tally2")
+```

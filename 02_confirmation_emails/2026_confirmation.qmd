@@ -1,0 +1,678 @@
+---
+title: "MSS 2026 - Confirmation Emails & Payment Capture"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+rm(list = ls())   
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(glue)
+library(purrr)
+library(blastula)
+library(googlesheets4)
+library(here)
+
+source(here::here("R", "config.R"))
+source(here::here("R", "firestore_api.R"))
+source(here::here("R", "helpers.R"))
+```
+
+## Load Registration Results
+
+The source of truth for who is CONFIRMED / PARTIAL / WAITLIST comes from the
+registration processing step (`01_registration/2026_registration_lindy.qmd`),
+which writes the `final_tally` sheet to Google Sheets.
+
+Payment details (Stripe PaymentIntent IDs, payment method) come from Firebase.
+
+```{r}
+#| label: load-data
+
+# ── 1. Read final_tally from the registration step (status, eligibility) ──
+final_tally <- read_sheet(
+  GOOGLE_SHEETS$registrations_2026,
+  sheet = "final_tally"
+)
+
+cat("Loaded final_tally:", nrow(final_tally), "rows\n")
+final_tally |> count(status) |> print()
+
+# ── 2. Fetch payment & email-tracking details from Firebase ──
+df_firebase <- fn_get_registrations() |>
+  filter(!is.na(email) & email != "") |>
+  mutate(email = str_to_lower(email))
+
+# Ensure expected columns exist (some may be absent if never written)
+if (!"stripe_payment_intent_id" %in% names(df_firebase)) {
+  df_firebase$stripe_payment_intent_id <- NA_character_
+}
+if (!"payment_method" %in% names(df_firebase)) {
+  df_firebase$payment_method <- NA_character_
+}
+if (!"confirmation_email_sent" %in% names(df_firebase)) {
+  df_firebase$confirmation_email_sent <- FALSE
+}
+if (!"confirmation_email_status" %in% names(df_firebase)) {
+  df_firebase$confirmation_email_status <- NA_character_
+}
+if (!"payment_status" %in% names(df_firebase)) {
+  df_firebase$payment_status <- NA_character_
+}
+if (!"fan" %in% names(df_firebase)) {
+  df_firebase$fan <- FALSE
+}
+
+df_firebase_slim <- df_firebase |>
+  select(id, stripe_payment_intent_id, payment_method,
+         confirmation_email_sent, confirmation_email_status, payment_status, fan)
+
+# ── 3. Join status with payment details ──
+# Drop payment_status from final_tally before joining — Firebase is the
+# up-to-date source and df_firebase_slim already carries it.
+df_registrations <- final_tally |>
+  select(-any_of("payment_status")) |>
+  left_join(df_firebase_slim, by = "id") |>
+  mutate(
+    name = str_to_title(name),
+
+    # Infer payment method when not explicitly set
+    payment_method = case_when(
+      !is.na(payment_method) & payment_method != "" ~ payment_method,
+      !is.na(stripe_payment_intent_id) &
+        stripe_payment_intent_id != ""              ~ "card",
+      TRUE                                          ~ "epassi"
+    ),
+
+    # Human-readable summaries
+    registered_for = pmap_chr(list(lindy, solo), function(l, s) {
+      parts <- c(
+        if (coalesce(l, FALSE)) "Lindy" else NULL,
+        if (coalesce(s, FALSE)) "Solo"  else NULL
+      )
+      if (length(parts) == 0) "-" else paste(parts, collapse = " + ")
+    }),
+    confirmed_for = pmap_chr(list(lindy_in, solo_in), function(l, s) {
+      parts <- c(
+        if (coalesce(l, FALSE)) "Lindy" else NULL,
+        if (coalesce(s, FALSE)) "Solo"  else NULL
+      )
+      if (length(parts) == 0) "-" else paste(parts, collapse = " + ")
+    }),
+
+    # Payment-method surcharge — needs to be added when the price is
+    # recalculated (fn_calculate_price doesn't include it).
+    # When total_price comes from amount_cents it already contains the surcharge.
+    #   ePassi / Smartum / Edenred: +5€
+    #   Invoice:                    +10€
+    #   Card:                        0€
+    payment_surcharge = case_when(
+      payment_method == "epassi"  ~ 5,
+      payment_method == "invoice" ~ 10,
+      TRUE ~ 0
+    ),
+
+    # Price: use the pre-authorized amount from Firebase (it includes pass + fan + surcharge).
+    # Exception: PARTIAL confirmations — recalculate based on confirmed tracks
+    # only, since the user won't pay for the track they didn't get into.
+    # WAITLIST people do not pay for anything (fan included) — price is 0.
+    # Fallback: if amount_cents is NA (e.g. non-card payments), recalculate.
+    # In both recalculated cases, payment_surcharge is added (0 for card).
+    total_price = case_when(
+      status == "WAITLIST" ~ 0,
+      status == "PARTIAL" ~ pmap_dbl(list(lindy_in, solo_in, fan), function(l, s, f) {
+        fn_calculate_price(
+          lindy_in = coalesce(l, FALSE),
+          solo_in  = coalesce(s, FALSE),
+          fan      = coalesce(as.logical(f), FALSE)
+        )
+      }) + payment_surcharge,
+      !is.na(amount_cents) ~ amount_cents / 100,
+      TRUE ~ pmap_dbl(list(lindy_in, solo_in, fan), function(l, s, f) {
+        fn_calculate_price(
+          lindy_in = coalesce(l, FALSE),
+          solo_in  = coalesce(s, FALSE),
+          fan      = coalesce(as.logical(f), FALSE)
+        )
+      }) + payment_surcharge
+    )
+  )
+
+# ── 4. Compute per-level sold-out flag from the locked pairs sheet ──
+# spots_left == 0 → level is fully booked (both roles at capacity).
+# spots_left > 0  → leader shortage (followers waiting for a leader to pair with).
+# Lindy levels only; Solo waitlist always gets the sold-out message since the
+# "find a leader" advice never applies there.
+lindy_pairs_locked <- tryCatch(
+  read_sheet(GOOGLE_SHEETS$registrations_2026, sheet = "lindy_pairs_locked"),
+  error = function(e) {
+    warning("Could not load lindy_pairs_locked sheet — defaulting all levels to sold_out = FALSE")
+    NULL
+  }
+)
+
+level_capacity <- if (!is.null(lindy_pairs_locked) && nrow(lindy_pairs_locked) > 0) {
+  lindy_pairs_locked |>
+    group_by(level) |>
+    summarise(
+      spots_left = max(0L, first(quota) - sum(!is.na(email_leader) & !is.na(email_follower), na.rm = TRUE)),
+      .groups = "drop"
+    ) |>
+    mutate(lindy_level_sold_out = spots_left == 0L)
+} else {
+  tibble(level = character(), spots_left = integer(), lindy_level_sold_out = logical())
+}
+
+cat("\nLindy level capacity:\n")
+print(level_capacity)
+
+# Join sold-out flag onto registrations (by their Lindy level)
+df_registrations <- df_registrations |>
+  left_join(level_capacity |> select(level, lindy_level_sold_out), by = "level") |>
+  mutate(
+    # A WAITLIST person is "sold out" when:
+    #   - Their Lindy level has no spots left, OR
+    #   - They registered for Lindy-only/Lindy+Solo but their level is full
+    # For Solo-only waitlist: the "find a leader" advice never applies → treat as sold out.
+    is_sold_out = case_when(
+      status != "WAITLIST" ~ FALSE,
+      # Solo-only registrants (no lindy) — no leader logic applies
+      !coalesce(lindy, FALSE) ~ TRUE,
+      # Lindy registrants — check whether their level has spots left
+      TRUE ~ coalesce(lindy_level_sold_out, FALSE)
+    )
+  )
+
+# Sanity check: must have exactly one row per email (no duplicates from join)
+stopifnot(
+  "df_registrations has duplicate emails after join!" =
+    n_distinct(df_registrations$email) == nrow(df_registrations)
+)
+
+cat("\nRegistrations with payment details loaded:", nrow(df_registrations), "rows\n")
+```
+
+## Filter Registrations to Process
+
+```{r}
+#| label: filter-to-process
+
+# Only process registrations that:
+#   1. Have a final status of CONFIRMED, PARTIAL, or WAITLIST (skip ON_HOLD)
+#   2. Have NOT already received an email for their CURRENT status
+#      (allows re-processing when status changes, e.g. WAITLIST → CONFIRMED)
+df_to_process <- df_registrations |>
+  filter(status %in% c("CONFIRMED", "PARTIAL", "WAITLIST")) |>
+  filter(
+    !coalesce(as.logical(confirmation_email_sent), FALSE) |
+    coalesce(confirmation_email_status, "") != status
+  )
+
+# Separate new registrations from status-changed ones (for diagnostics)
+df_new <- df_to_process |>
+  filter(!coalesce(as.logical(confirmation_email_sent), FALSE))
+df_status_changed <- df_to_process |>
+  filter(coalesce(as.logical(confirmation_email_sent), FALSE))
+
+cat("\n=== REGISTRATIONS TO PROCESS ===\n")
+cat("Total:", nrow(df_to_process), "\n")
+cat("  New (never emailed):", nrow(df_new), "\n")
+cat("  Status changed (re-process):", nrow(df_status_changed), "\n")
+
+if (nrow(df_status_changed) > 0) {
+  cat("\n  Status changes:\n")
+  df_status_changed |>
+    mutate(transition = paste(coalesce(confirmation_email_status, "?"), "→", status)) |>
+    count(transition) |>
+    print()
+}
+
+cat("\nBy status:\n")
+df_to_process |> count(status) |> print()
+
+cat("\nBy payment method:\n")
+df_to_process |> count(payment_method) |> print()
+
+cat("\nBy status × payment method:\n")
+df_to_process |> count(status, payment_method) |> print()
+```
+
+## Email Templates
+
+```{r}
+#| label: email-templates
+
+# Logo for email footer
+img_string <- fn_get_logo()
+
+# Payment text blocks (all from shared config / helpers)
+# Note: ePassi text is generated per-user (needs total_price for surcharge)
+txt_payment_card_ok     <- EMAIL_MESSAGES$payment_captured
+txt_payment_card_failed <- fn_payment_card_failed_text()
+
+# ─────────────────────────────────────────────────────
+# Build email
+# ─────────────────────────────────────────────────────
+
+fn_build_email <- function(name, status, role, level,
+                           registered_for, confirmed_for,
+                           total_price, fan, payment_section,
+                           is_sold_out = FALSE) {
+
+  # Guard against NULL / NA in every input
+  safe_chr <- function(x, default = "") if (is.null(x) || length(x) == 0) default else coalesce(as.character(x), default)
+  safe_num <- function(x, default = 0)  if (is.null(x) || length(x) == 0) default else coalesce(as.numeric(x), default)
+  safe_lgl <- function(x, default = FALSE) if (is.null(x) || length(x) == 0) default else coalesce(as.logical(x), default)
+
+  name            <- safe_chr(name)
+  status          <- safe_chr(status, "WAITLIST")
+  role            <- str_to_title(safe_chr(role, "-"))
+  level           <- str_to_title(safe_chr(level, "-"))
+  registered_for  <- safe_chr(registered_for, "-")
+  confirmed_for   <- safe_chr(confirmed_for, "-")
+  total_price     <- safe_num(total_price)
+  fan             <- safe_lgl(fan)
+  payment_section <- safe_chr(payment_section)
+  is_sold_out     <- safe_lgl(is_sold_out)
+
+  # Intro text (from shared config)
+  intro_text <- case_when(
+    status == "CONFIRMED" ~ EMAIL_MESSAGES$confirmation,
+    status == "PARTIAL"   ~ EMAIL_MESSAGES$partial_confirmation,
+    is_sold_out           ~ EMAIL_MESSAGES$waitlist_sold_out,
+    TRUE                  ~ EMAIL_MESSAGES$waitlist
+  )
+
+  # Fan line (only if they ordered one)
+  fan_line <- if (fan) "\n  - Fan: **Yes**" else ""
+
+  # Registration details
+  # Note: WAITLIST people do not pay for the fan (18€), so we don't show it
+  details_text <- if (status == "WAITLIST") {
+    glue(
+      "These are the details of your registration:\n",
+      "  - You registered for: **{registered_for}**\n",
+      "  - Role: **{role}**\n",
+      "  - Level: **{level}**"
+    )
+  } else {
+    glue(
+      "These are the details of your registration:\n",
+      "  - You registered for: **{registered_for}**\n",
+      "  - Role: **{role}**\n",
+      "  - Level: **{level}**\n",
+      "  - You have been confirmed for: **{confirmed_for}**",
+      fan_line, "\n",
+      "  - Total price: **{total_price}€**"
+    )
+  }
+
+  # Waitlist options (WAITLIST only — PARTIAL people are confirmed for Lindy
+  # but waitlisted for Solo Jazz, which has no partner requirement,
+  # so the "find a leader" suggestions don't apply).
+  # When the level is fully sold out, skip the leader-shortage advice and
+  # show a simpler "we'll contact you" message instead.
+  waitlist_text <- if (status == "WAITLIST") {
+    if (is_sold_out) EMAIL_MESSAGES$waitlist_options_sold_out else fn_waitlist_options()
+  } else {
+    NULL
+  }
+
+  # Social links (from shared config)
+  social_text <- fn_social_links()
+
+  # Closing text (softer wording for waitlisted users)
+  closing_text <- if (status == "WAITLIST") "We'll keep you updated!" else "See you soon in Helsinki!"
+
+  # Build body from non-empty sections (avoids blank-line gaps)
+  sections <- c(
+    glue("Hello {name}"),
+    intro_text,
+    details_text,
+    if (nzchar(payment_section)) payment_section else NULL,
+    waitlist_text,
+    social_text,
+    closing_text,
+    img_string
+  )
+
+  email_body <- md(paste(sections, collapse = "\n\n"))
+
+  compose_email(
+    body = email_body,
+    title = "Welcome to Midnight Sun Swing",
+    footer = "Midnight Sun Swing"
+  )
+}
+
+# ─────────────────────────────────────────────────────
+# Email subject helper
+# ─────────────────────────────────────────────────────
+
+fn_get_subject <- function(status) {
+  case_when(
+    status == "CONFIRMED" ~ EMAIL_SUBJECTS$confirmation,
+    status == "PARTIAL"   ~ EMAIL_SUBJECTS$partial_confirmation,
+    status == "WAITLIST"  ~ EMAIL_SUBJECTS$waitlist,
+    TRUE ~ paste0("MSS ", CURRENT_YEAR, " - Registration Update")
+  )
+}
+```
+
+## Preview Emails (Dry Run — All Possible Cases)
+
+```{r}
+#| label: preview-emails
+
+# ─────────────────────────────────────────────────────────────────────
+# Dry-run preview: one email for EVERY possible case in the flow.
+# Cases are defined by: status × payment_method × capture_outcome.
+# This ensures you review every email variant before sending anything.
+# ─────────────────────────────────────────────────────────────────────
+
+email_cases <- tribble(
+  ~case_id, ~case_label,                        ~status,     ~payment_method, ~capture_outcome, ~registered_for, ~confirmed_for, ~lindy_in, ~solo_in, ~is_sold_out,
+   1L, "CONFIRMED + Card (captured)",            "CONFIRMED", "card",    "ok",             "Lindy + Solo", "Lindy + Solo", TRUE,  TRUE,  FALSE,
+   2L, "CONFIRMED + Card (capture failed)",      "CONFIRMED", "card",    "failed",         "Lindy + Solo", "Lindy + Solo", TRUE,  TRUE,  FALSE,
+   3L, "CONFIRMED + ePassi",                     "CONFIRMED", "epassi",  NA_character_,    "Lindy + Solo", "Lindy + Solo", TRUE,  TRUE,  FALSE,
+   4L, "CONFIRMED + Invoice",                    "CONFIRMED", "invoice", NA_character_,    "Lindy + Solo", "Lindy + Solo", TRUE,  TRUE,  FALSE,
+   5L, "PARTIAL + Card (captured)",              "PARTIAL",   "card",    "ok",             "Lindy + Solo", "Lindy",        TRUE,  FALSE, FALSE,
+   6L, "PARTIAL + Card (capture failed)",        "PARTIAL",   "card",    "failed",         "Lindy + Solo", "Lindy",        TRUE,  FALSE, FALSE,
+   7L, "PARTIAL + ePassi",                       "PARTIAL",   "epassi",  NA_character_,    "Lindy + Solo", "Lindy",        TRUE,  FALSE, FALSE,
+   8L, "PARTIAL + Invoice",                      "PARTIAL",   "invoice", NA_character_,    "Lindy + Solo", "Lindy",        TRUE,  FALSE, FALSE,
+   9L, "WAITLIST (leader shortage)",             "WAITLIST",  NA_character_, NA_character_, "Lindy",        "-",            FALSE, FALSE, FALSE,
+  10L, "WAITLIST (level fully sold out)",        "WAITLIST",  NA_character_, NA_character_, "Lindy",        "-",            FALSE, FALSE, TRUE
+)
+
+# Use a real registration as template for name / role / level / fan
+template <- if (nrow(df_to_process) > 0) {
+  df_to_process |> slice(1)
+} else {
+  df_registrations |> slice(1)
+}
+
+cat("Using template registration:", template$name, "(", template$email, ")\n")
+cat("Generating", nrow(email_cases), "preview emails...\n")
+
+for (idx in seq_len(nrow(email_cases))) {
+  case <- email_cases[idx, ]
+
+  # Calculate price for this specific case (add payment-method surcharge)
+  # WAITLIST people do not pay for the fan
+  case_fan <- if (case$status == "WAITLIST") FALSE else coalesce(as.logical(template$fan), FALSE)
+  mock_price <- fn_calculate_price(
+    lindy_in = case$lindy_in,
+    solo_in  = case$solo_in,
+    fan      = case_fan
+  )
+  if (!is.na(case$payment_method)) {
+    if (case$payment_method == "epassi")  mock_price <- mock_price + 5
+    if (case$payment_method == "invoice") mock_price <- mock_price + 10
+  }
+
+  # Determine the payment section for this case
+  payment_section <- if (case$status %in% c("CONFIRMED", "PARTIAL")) {
+    if (!is.na(case$payment_method) && case$payment_method == "card") {
+      if (!is.na(case$capture_outcome) && case$capture_outcome == "ok") {
+        txt_payment_card_ok
+      } else {
+        txt_payment_card_failed
+      }
+    } else if (!is.na(case$payment_method) && case$payment_method == "invoice") {
+      fn_payment_invoice_text()
+    } else {
+      # ePassi: surcharge is always included in mock_price / total_price
+      fn_payment_epassi_text(mock_price, surcharge_included = TRUE)
+    }
+  } else {
+    ""
+  }
+
+  cat("\n", strrep("=", 70), "\n", sep = "")
+  cat(" CASE ", case$case_id, "/", nrow(email_cases), ": ", case$case_label, "\n", sep = "")
+  cat(strrep("=", 70), "\n")
+  cat("  To:              ", template$email, "\n")
+  cat("  Name:            ", template$name, "\n")
+  cat("  Subject:         ", fn_get_subject(case$status), "\n")
+  cat("  Status:          ", case$status, "\n")
+  cat("  Payment method:  ", coalesce(case$payment_method, "(n/a)"), "\n")
+  if (!is.na(case$capture_outcome)) {
+    cat("  Capture outcome: ", case$capture_outcome, "\n")
+  }
+  cat("  Registered for:  ", case$registered_for, "\n")
+  cat("  Confirmed for:   ", case$confirmed_for, "\n")
+  cat("  Price:           ", mock_price, "€\n")
+  cat(strrep("-", 70), "\n")
+
+  preview_email <- fn_build_email(
+    name            = template$name,
+    status          = case$status,
+    role            = template$role,
+    level           = template$level,
+    registered_for  = case$registered_for,
+    confirmed_for   = case$confirmed_for,
+    total_price     = mock_price,
+    fan             = case_fan,
+    payment_section = payment_section,
+    is_sold_out     = case$is_sold_out
+  )
+
+  print(preview_email)
+}
+```
+
+## Process Confirmations (Capture Payments + Send Emails)
+
+```{r}
+#| label: process-confirmations
+#| eval: false
+
+# ⚠️ SET eval: true TO ACTUALLY PROCESS
+# This will capture payments and send emails!
+#
+# FAIL-FAST: The loop STOPS on any error — no silent failures.
+# Already-processed registrations are automatically skipped (idempotent),
+# so it is always safe to fix the issue and re-run from the top.
+#
+# Stripe capture failures are recorded in Firebase as 'capture_failed'.
+# On re-run, those registrations get the card-failed email instead of
+# re-attempting the capture — review and reset payment_status if you
+# want to retry the capture.
+
+results <- list(
+  processed        = 0L,
+  payment_captured = 0L,
+  payment_skipped  = 0L,
+  epassi_pending   = 0L,
+  invoice_pending  = 0L,
+  emails_sent      = 0L
+)
+
+for (i in 1:nrow(df_to_process)) {
+  reg <- df_to_process[i, ]
+
+  cat("\n", strrep("=", 60), "\n", sep = "")
+  cat(" Processing ", i, "/", nrow(df_to_process), ": ", reg$email, "\n", sep = "")
+  cat(strrep("=", 60), "\n")
+  cat("  Status:          ", reg$status, "\n")
+  cat("  Payment method:  ", reg$payment_method, "\n")
+  cat("  Payment status:  ", coalesce(reg$payment_status, "(none)"), "\n")
+
+  payment_section   <- ""
+  already_captured  <- coalesce(reg$payment_status, "") == "captured"
+  prev_capture_fail <- coalesce(reg$payment_status, "") %in% c("capture_failed", "pending",
+                                                               "payment_failed", "canceled")
+
+  # ── CONFIRMED / PARTIAL: handle payment ──────────────────────────
+  if (reg$status %in% c("CONFIRMED", "PARTIAL")) {
+
+    if (reg$payment_method == "card" &&
+        !is.na(reg$stripe_payment_intent_id) &&
+        reg$stripe_payment_intent_id != "") {
+
+      if (already_captured) {
+        # Already captured on a previous run — nothing to do
+        cat("  ⏭ Payment already captured — skipping Stripe call\n")
+        results$payment_skipped <- results$payment_skipped + 1L
+        payment_section <- txt_payment_card_ok
+
+      } else if (prev_capture_fail) {
+        # A previous run tried to capture and failed.
+        # Send card-failed email with alternative payment instructions.
+        # To retry the capture instead, reset payment_status in Firebase first.
+        cat("  ⚠ Previous capture failed — sending card-failed instructions\n")
+        payment_section <- txt_payment_card_failed
+
+      } else {
+        # First attempt — capture the pre-authorized Stripe payment.
+        # For PARTIAL, capture only the recalculated (lower) amount.
+        capture_amount <- if (reg$status == "PARTIAL") reg$total_price * 100 else NULL
+        cat("  Capturing payment: ", reg$stripe_payment_intent_id, "\n")
+
+        capture_ok <- tryCatch({
+          fn_capture_payment(reg$stripe_payment_intent_id, amount_to_capture = capture_amount)
+          TRUE
+        }, error = function(e) {
+          # Record failure in Firebase so the next re-run won't retry blindly
+          fn_update_registration(reg$id, list(
+            payment_status = "capture_failed",
+            capture_error  = conditionMessage(e)
+          ))
+          # Stop the loop with the original error visible
+          stop(
+            "Stripe capture FAILED for ", reg$email, ": ", conditionMessage(e), "\n",
+            "  Firebase marked as 'capture_failed'.\n",
+            "  Review the issue, then re-run. On re-run this registration will get\n",
+            "  the card-failed email with alternative payment instructions.\n",
+            "  To retry the capture, reset payment_status in Firebase first."
+          )
+        })
+
+        fn_update_registration(reg$id, list(payment_status = "captured"))
+        results$payment_captured <- results$payment_captured + 1L
+        cat("  ✓ Payment captured\n")
+        payment_section <- txt_payment_card_ok
+      }
+
+    } else if (reg$payment_method == "invoice") {
+      cat("  Invoice payment — will send invoice separately\n")
+      if (!already_captured) {
+        fn_update_registration(reg$id, list(payment_status = "awaiting_invoice"))
+      }
+      results$invoice_pending <- results$invoice_pending + 1L
+      payment_section <- fn_payment_invoice_text()
+
+    } else {
+      # ePassi / Smartum / bank transfer
+      cat("  Non-card payment — sending payment instructions\n")
+      if (!already_captured) {
+        fn_update_registration(reg$id, list(payment_status = "awaiting_payment"))
+      }
+      results$epassi_pending <- results$epassi_pending + 1L
+      # ePassi surcharge is always included in total_price
+      payment_section <- fn_payment_epassi_text(
+        reg$total_price,
+        surcharge_included = TRUE
+      )
+    }
+
+  # ── WAITLIST: keep pre-auth on hold ──────────────────────────────
+  } else if (reg$status == "WAITLIST") {
+    cat("  Waitlisted — keeping pre-auth on hold\n")
+  }
+
+  # ── Build and send email ─────────────────────────────────────────
+  email <- fn_build_email(
+    name            = reg$name,
+    status          = reg$status,
+    role            = reg$role,
+    level           = reg$level,
+    registered_for  = reg$registered_for,
+    confirmed_for   = reg$confirmed_for,
+    total_price     = reg$total_price,
+    fan             = reg$fan,
+    payment_section = payment_section,
+    is_sold_out     = coalesce(reg$is_sold_out, FALSE)
+  )
+  
+  email
+
+  sent <- fn_send_email(
+    email_object = email,
+    to           = reg$email,
+    subject      = fn_get_subject(reg$status)
+  )
+
+  if (!sent) {
+    stop(
+      "FAILED to send email to ", reg$email,
+      " (registration ", i, "/", nrow(df_to_process), ").\n",
+      "Fix the issue and re-run — already-processed registrations will be skipped."
+    )
+  }
+  results$emails_sent <- results$emails_sent + 1L
+
+  # ── Update Firebase (stops on failure to prevent duplicate emails) ──
+  fn_update_registration(reg$id, list(
+    confirmation_email_sent   = TRUE,
+    confirmation_email_status = reg$status,
+    confirmation_email_date   = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ")
+  ))
+
+  results$processed <- results$processed + 1L
+  cat("  ✓ Done (", i, "/", nrow(df_to_process), ")\n", sep = "")
+
+  # Pace the loop — gives time to inspect output and Ctrl-C if needed
+  if (i < nrow(df_to_process)) {
+    cat("  Waiting 3 seconds before next...\n")
+    Sys.sleep(3)
+  }
+}
+
+cat("\n\n", strrep("=", 60), "\n", sep = "")
+cat(" PROCESSING COMPLETE\n")
+cat(strrep("=", 60), "\n")
+cat("Total processed:            ", results$processed, "\n")
+cat("Card payments captured:     ", results$payment_captured, "\n")
+cat("Card payments skipped (dup):", results$payment_skipped, "\n")
+cat("ePassi/other pending:       ", results$epassi_pending, "\n")
+cat("Invoice pending:            ", results$invoice_pending, "\n")
+cat("Emails sent:                ", results$emails_sent, "\n")
+```
+
+## Summary Report
+
+```{r}
+#| label: summary
+
+
+cat("=== REGISTRATION STATUS SUMMARY ===\n")
+df_registrations |>
+  count(status) |>
+  arrange(desc(n)) |>
+  print()
+
+cat("\n=== CONFIRMATION EMAIL STATUS ===\n")
+df_registrations |>
+  mutate(
+    email_sent    = coalesce(as.logical(confirmation_email_sent), FALSE),
+    emailed_as    = coalesce(confirmation_email_status, "(none)"),
+    status_changed = email_sent & emailed_as != status
+  ) |>
+  count(status, email_sent, emailed_as, status_changed) |>
+  arrange(status) |>
+  print()
+
+cat("\n=== PAYMENT METHOD BREAKDOWN ===\n")
+df_registrations |>
+  filter(status %in% c("CONFIRMED", "PARTIAL")) |>
+  count(payment_method, payment_status) |>
+  pivot_wider(names_from = payment_method, values_from = n)
+```

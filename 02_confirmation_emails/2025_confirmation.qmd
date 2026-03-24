@@ -1,0 +1,170 @@
+---
+title: "emails_2025"
+format: html
+editor: visual
+---
+
+```{r LIBRARIES}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+
+gs4_auth(email = "vicent.boned.11@gmail.com")
+responses_2025 <- "https://docs.google.com/spreadsheets/d/1SeBYtYHBqXbiMc3HsSY7Y5kSSMDBp1SE8xZIm9_qJig/edit?resourcekey=&gid=1332098813#gid=1332098813"
+```
+
+```{r CLEAN DATA READ}
+clean_groups_df <- read_sheet(ss = responses_2025, sheet = "clean_groups_df")
+final_tally <- read_sheet(ss = responses_2025, sheet = "final_tally")
+```
+
+```{r EMAIL}
+img_string <- add_image(file = "~/Documents/GitHub/midnightsun_swing/midnightsunswing.jpeg")
+
+txt_conf <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are happy to **confirm** your spot for it!")
+
+txt_partially_conf <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are happy to **partially confirm** your spot for it! \n(That means that you are IN one of the tracks, and on the waitlist for the other)")
+
+txt_waitlist <- glue::glue("Thank you for registering to Midnight Sun Swing Festival. We are sad to inform you that **you are currently on the waiting list**.")
+
+
+txt_details <- function(rr, cc, tsh, tp){
+  out <- glue::glue("These are the details of your registration:
+    - {rr}
+    - {cc}
+    - T-shirt: **{coalesce(tsh, \"-\")}**
+    - {tp}")
+  return(out)
+}
+
+txt_followus <- glue::glue("Follow us to be up to date with all the information about Midnight Sun Swing Festival in the [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/3GYa2RtE6)
+                           
+Schedule details will be sent closer to the start of the festival but you can the check preliminary one in our website")
+
+txt_payment <- function(xx){glue::glue("Please proceed with the **payment in the next 14 days** and use the code **{xx}** in the reference message.
+You can pay by SEPA bank transfer to the following account:
+  - Bank account: **FI82 7997 7996 5259 81**
+  - Payee: **Osuuskunta Swing Kollektiivi**
+  - BIC: **HOLVFIHH (Only SEPA payments)**
+  - Address: **Karjalankatu 2, 00520 Helsinki, Finland**
+  - VAT ID: **FI28578381** _(In case you need it)_
+  
+You can also pay using _ePassi/Smartum/Edenred_ to Black Pepper Swing or by card if you are unable to do a bank transfer.")}
+
+txt_waitlist_options <- glue::glue("
+Here are a few options for the track you are on waitlist:
+  - Invite someone with the opposite role to register **in the same level!** _(make sure they add your email as their partner)_
+  - **Wait until more people register so we can get you paired with them and keep good balance of roles**
+  - **Switch to leader role** (We still have some spots in Lindy Intermediate, and Advanced and Balboa)
+  
+  If you decide to wait, we will send you an email when you get a spot. If you want to withdraw from the queue of this track you can send us an email.")
+
+conf_email <- function(var_firstname, 
+                       var_registration, 
+                       var_confirmation,
+                       var_tshirt_answer, 
+                       var_confirmed,
+                       var_total_price, xx) {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {if(var_confirmed == 'Confirmed'){txt_conf} else if(var_confirmed == 'Waitlist') {txt_waitlist} else {txt_partially_conf}}
+  
+  {txt_details(var_registration,var_confirmation, var_tshirt_answer, var_total_price)}
+  
+  {if(var_confirmed %in% c('Confirmed','Partially confirmed')){txt_payment(xx)} else {txt_waitlist_options}}
+  
+  {if(var_confirmed %in% c('Partially confirmed')){txt_waitlist_options} else {''}}
+
+  {txt_followus}
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+
+txt_header_email <- function(status) {
+  case_when(
+    status == "Confirmed" ~ "MSS 2025 - Confirmation",
+    status == "Partially confirmed" ~ "MSS 2025 - Partial Confirmation",
+    status == "Waitlist" ~ "MSS 2025 - Waitlist",
+    TRUE ~ "MSS 2025 - Unknown (something failed in the email system, contact us)"
+  )
+}
+```
+
+```{r DATA PREP}
+for(ii in 65:nrow(final_tally)){
+  prep_data <- final_tally[ii,] %>% 
+    inner_join(clean_groups_df,by = c("email","lindy","balboa","solo")) %>%
+  mutate(rr = glue::glue("You have registered for: **{paste(c(if (!is.na(lindy) && lindy) 'Lindy', 
+                                                         if (!is.na(balboa) && balboa) 'Balboa', 
+                                                         if (!is.na(solo) && solo) 'Solo'), 
+                                                   collapse = ' + ')}**"),
+         cc = glue::glue("You have been confirmed for: **{paste(c(if (!is.na(lindy_in) && lindy_in) 'Lindy', 
+                                                         if (!is.na(balboa_in) && balboa_in) 'Balboa', 
+                                                         if (!is.na(solo_in) && solo_in) 'Solo'), 
+                                                   collapse = ' + ')}**"),
+    base_price = case_when(
+      !is.na(lindy_in) && lindy_in & (is.na(balboa_in) | !balboa_in) & (is.na(solo_in) | !solo_in) ~ 195,
+      !is.na(lindy_in) && lindy_in & !is.na(balboa_in) && balboa_in & (is.na(solo_in) | !solo_in) ~ 250,
+      !is.na(lindy_in) && lindy_in & (is.na(balboa_in) | !balboa_in) & !is.na(solo_in) && solo_in ~ 250,
+      !is.na(lindy_in) && lindy_in & !is.na(balboa_in) && balboa_in & !is.na(solo_in) && solo_in ~ 330,
+      (is.na(lindy_in) | !lindy_in) & !is.na(balboa_in) && balboa_in & (is.na(solo_in) | !solo_in) ~ 105,
+      TRUE ~ NA_real_
+    ),
+    wanted = sum(lindy,balboa,solo,na.rm=T),  # Count how many styles they wanted
+    admitted = sum(lindy_in,balboa_in,solo_in, na.rm = T),
+    status = case_when(
+      wanted == admitted ~ "Confirmed",
+      admitted > 0 ~ "Partially confirmed",
+      TRUE ~ "Waitlist"
+    ),
+
+    tshirt_price = ifelse(status != "Waitlist" & !is.na(tshirt) & tshirt == "Yes, of course!", 25, 0),
+    
+    tp = coalesce(base_price,0) + coalesce(tshirt_price,0),
+    
+    tpa = glue("{coalesce(base_price,0)}€ {if (tshirt_price > 0) glue(' + {coalesce(tshirt_price,0)}€') else ''}"),
+    
+    total_price = glue("Total price: **{coalesce(tp,0)}€** ({tpa})")
+
+  )
+  
+email <- conf_email(prep_data$name, 
+           var_registration = prep_data$rr,
+           var_confirmation = if_else(prep_data$status == "Waitlist", "You are confirmed for: **-**", prep_data$cc),
+           var_tshirt_answer = if_else(prep_data$status == "Waitlist", "**-**", prep_data$tshirt_size),
+           var_confirmed = prep_data$status,
+           var_total_price = prep_data$total_price,
+           xx = paste0("MSS",ii)) 
+
+  email_to_send <- compose_email(
+    body = md(email),
+    title = "Welcome to Midnight Sun Swing",
+    footer = "Midnight Sun Swing"
+    )
+  
+  email_to_send
+  
+  range_write(ss = responses_2025,
+            data = tibble(prep_data$name, prep_data$email, prep_data$status, Sys.Date(), paste0("MSS",ii)),
+            sheet = "emails",
+            range = paste0("A",ii + 1),
+            col_names = F,reformat = F)
+  
+  if(length(prep_data$email)>1) {stop()}
+  
+  smtp_send(
+    email_to_send,
+    to = prep_data$email,
+    from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+    subject = txt_header_email(prep_data$status),
+    credentials = creds_file(file = "~/Documents/gmail_creds")
+  )
+  cat(ii, "/", nrow(final_tally), "\n")
+  Sys.sleep(2)
+}
+
+```

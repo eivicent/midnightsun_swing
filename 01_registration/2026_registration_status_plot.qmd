@@ -1,0 +1,211 @@
+---
+title: "MSS 2026 — Registration Status"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+library(googlesheets4)
+library(scales)
+library(here)
+
+source(here::here("R", "config.R"))
+```
+
+## Load & Prepare Data
+
+```{r}
+#| label: load-data
+
+lindy_pairs <- read_sheet(
+  GOOGLE_SHEETS$registrations_2026,
+  sheet = "lindy_pairs_locked"
+)
+
+LINDY_QUOTAS <- tibble(
+  level = c("intermediate", "int-advanced", "advanced"),
+  quota = c(
+    GROUP_CAPACITIES$intermediate,
+    GROUP_CAPACITIES$intermediate_advanced,
+    GROUP_CAPACITIES$advanced
+  )
+)
+
+if (!"quota" %in% names(lindy_pairs)) {
+  lindy_pairs <- lindy_pairs |>
+    left_join(LINDY_QUOTAS, by = "level")
+}
+
+# ── Festival palette ──
+col_empty  <- "#E26941"   # orange (spots left)
+col_filled <- "#0D3447"   # dark navy (registered)
+col_bg     <- "#FFE17B"   # golden yellow (background)
+col_accent <- "#4E332E"   # dark brown
+
+# ── Counts per level + role ──
+reg_counts <- lindy_pairs |>
+  group_by(level) |>
+  summarise(
+    Leaders   = sum(!is.na(email_leader)),
+    Followers = sum(!is.na(email_follower)),
+    quota     = first(quota),
+    .groups   = "drop"
+  ) |>
+  pivot_longer(
+    cols      = c(Leaders, Followers),
+    names_to  = "role",
+    values_to = "registered"
+  ) |>
+  mutate(
+    remaining = pmax(quota - registered, 0),
+    level     = factor(
+      level,
+      levels = c("intermediate", "int-advanced", "advanced"),
+      labels = c("Intermediate", "Int-Advanced", "Advanced")
+    ),
+    pct   = registered / quota,
+    label = paste0(registered, " / ", quota)
+  )
+
+# ── Long format for stacked bars ──
+bar_data <- reg_counts |>
+  pivot_longer(
+    cols      = c(registered, remaining),
+    names_to  = "status",
+    values_to = "count"
+  ) |>
+  mutate(
+    status = factor(
+      status,
+      levels = c("remaining", "registered"),
+      labels = c("Spots left", "Registered")
+    )
+  )
+```
+
+## Overview — All Levels
+
+```{r}
+#| label: overview-plot
+#| fig-width: 11
+#| fig-height: 6.5
+
+ggplot(bar_data, aes(x = role, y = count, fill = status)) +
+  geom_col(width = 0.65, colour = col_filled, linewidth = 0.3) +
+  geom_text(
+    data    = reg_counts,
+    aes(x = role, y = registered / 2,
+        label = percent(pct, accuracy = 1), fill = NULL),
+    colour  = "white", fontface = "bold", size = 5
+  ) +
+  geom_text(
+    data    = reg_counts,
+    aes(x = role, y = quota, label = label, fill = NULL),
+    vjust   = -0.6, colour = col_filled, fontface = "bold", size = 4
+  ) +
+  facet_wrap(~ level, nrow = 1) +
+  scale_fill_manual(
+    values = c("Registered" = col_filled, "Spots left" = col_empty),
+    name   = NULL
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Midnight Sun Swing 2026",
+    subtitle = "Leaders & Followers per Level (pair quota)",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    text             = element_text(family = "sans"),
+    plot.title       = element_text(colour = col_filled, face = "bold",
+                                    size = 22, hjust = 0.5),
+    plot.subtitle    = element_text(colour = col_filled, size = 13,
+                                    hjust = 0.5, margin = margin(b = 12)),
+    strip.text       = element_text(colour = col_filled, face = "bold", size = 15),
+    strip.background = element_rect(fill = col_empty, colour = NA),
+    axis.text.y      = element_blank(),
+    axis.ticks       = element_blank(),
+    panel.grid       = element_blank(),
+    legend.position  = "top",
+    legend.text      = element_text(size = 12),
+    plot.background  = element_rect(fill = col_bg, colour = NA),
+    panel.background = element_rect(fill = col_bg, colour = NA),
+    plot.margin      = margin(15, 15, 10, 15)
+  )
+```
+
+## Instagram Chart — All Levels
+
+```{r}
+#| label: instagram-plot
+#| fig-width: 6
+#| fig-height: 7.5
+
+ig_dir <- here::here("01_registration", "instagram")
+dir.create(ig_dir, showWarnings = FALSE, recursive = TRUE)
+
+ig_plot <- ggplot(bar_data, aes(x = level, y = count, fill = status)) +
+  geom_col(width = 0.6, colour = col_filled, linewidth = 0.4) +
+  # Percentage inside the registered portion
+  geom_text(
+    data   = reg_counts,
+    aes(x = level, y = registered / 2,
+        label = percent(pct, accuracy = 1), fill = NULL),
+    colour = "white", fontface = "bold", size = 5.5
+  ) +
+  # "n / quota" to the right of each bar
+  geom_text(
+    data  = reg_counts,
+    aes(x = level, y = quota, label = label, fill = NULL),
+    hjust = -0.15, colour = col_filled, fontface = "bold", size = 4.5
+  ) +
+  coord_flip() +
+  scale_x_discrete(limits = rev) +
+  facet_wrap(~ role, ncol = 1) +
+  scale_fill_manual(
+    values = c("Registered" = col_filled, "Spots left" = col_empty)
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.32))) +
+  labs(
+    title   = "Midnight Sun Swing 2026",
+    caption = "@midnightsun_swing",
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    text             = element_text(family = "sans"),
+    plot.title       = element_text(colour = col_filled, face = "bold",
+                                    size = 26, hjust = 0.5,
+                                    margin = margin(b = 12)),
+    plot.caption     = element_text(colour = col_accent, size = 11,
+                                    hjust = 0.5, margin = margin(t = 10)),
+    strip.text       = element_text(colour = col_filled, face = "bold", size = 18),
+    strip.background = element_rect(fill = col_empty, colour = NA),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(colour = col_filled, face = "bold", size = 14),
+    axis.ticks       = element_blank(),
+    panel.grid       = element_blank(),
+    legend.position  = "none",
+    plot.background  = element_rect(fill = col_bg, colour = NA),
+    panel.background = element_rect(fill = col_bg, colour = NA),
+    plot.margin      = margin(20, 40, 15, 20)
+  )
+
+# Save 1080 × 1350 px (4:5 Instagram portrait)
+ggsave(
+  filename = file.path(ig_dir, "all_levels_ig.png"),
+  plot     = ig_plot,
+  width = 6, height = 7.5, dpi = 180, bg = col_bg
+)
+
+ig_plot
+```

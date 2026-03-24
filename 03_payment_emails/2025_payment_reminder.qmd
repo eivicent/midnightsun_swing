@@ -1,0 +1,146 @@
+---
+title: "thank_you_email"
+format: html
+---
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+library(glue)
+ss <- "https://docs.google.com/spreadsheets/d/1SeBYtYHBqXbiMc3HsSY7Y5kSSMDBp1SE8xZIm9_qJig/edit?resourcekey=&gid=675546517#gid=675546517"
+```
+
+```{r EMAIL}
+img_string <- add_image(file = "~/Documents/GitHub/midnightsun_swing/midnightsunswing.jpeg")
+
+txt_reminder <- glue::glue("We **confirmed** your spot in the festival a while ago, but we haven't received your payment yet.
+                           **If you have already paid, please let us know, as we might have missed it!**(apologies about that)")
+
+txt_details <- function(rr, cc, tsh, tp){
+  out <- glue::glue("These are the details of your registration:
+    - {rr}
+    - {cc}
+    - T-shirt: **{coalesce(tsh, \"-\")}**
+    - {tp}")
+  return(out)
+}
+
+txt_followus <- glue::glue("Follow us to be up to date with all the information about Midnight Sun Swing Festival in the [Website](https://www.midnightsunswing.fi/) // [Instagram](https://www.instagram.com/midnightsun_swing/) // [Facebook](https://fb.me/e/3GYa2RtE6)
+                           
+Schedule details will be sent closer to the start of the festival but you can the check preliminary one in our website")
+
+txt_payment <- function(xx){glue::glue("Please proceed with the **payment in the next 14 days** and use the code **{xx}** in the reference message.
+You can pay by SEPA bank transfer to the following account:
+  - Bank account: **FI82 7997 7996 5259 81**
+  - Payee: **Osuuskunta Swing Kollektiivi**
+  - BIC: **HOLVFIHH (Only SEPA payments)**
+  - Address: **Karjalankatu 2, 00520 Helsinki, Finland**
+  - VAT ID: **FI28578381** _(In case you need it)_
+  
+You can also pay using _ePassi/Smartum/Edenred_ to Black Pepper Swing or by card if you are unable to do a bank transfer.")}
+
+reminder_email <- function(var_firstname, 
+                       var_registration, 
+                       var_confirmation,
+                       var_tshirt_answer, 
+                       var_confirmed,
+                       var_total_price, xx) {
+  out <- md(glue::glue(
+  "Hello {var_firstname}
+  
+  {txt_reminder}
+  
+  {txt_details(var_registration,var_confirmation, var_tshirt_answer, var_total_price)}
+  
+  {txt_payment(xx)}
+  
+  {txt_followus}
+  
+  See you soon in Helsinki!
+  {img_string}  
+  "))
+  return(out)
+}
+```
+
+```{r}
+final_tally <- read_sheet(ss, sheet = "final_tally")
+clean_groups_df <- read_sheet(ss, sheet = "clean_groups_df")
+emails <- read_sheet(ss, sheet = "emails")
+
+payment_reminder <- final_tally %>% filter(is.na(PAID)) %>% 
+  filter(is.na(REASON))
+```
+
+
+```{r}
+for(ii in 1:nrow(payment_reminder)){
+  prep_data <- payment_reminder[ii,] %>% 
+    inner_join(clean_groups_df,by = c("email","lindy","balboa","solo")) %>%
+    left_join(emails, by = c("email" = "Email")) %>% 
+  mutate(rr = glue::glue("You have registered for: **{paste(c(if (!is.na(lindy) && lindy) 'Lindy', 
+                                                         if (!is.na(balboa) && balboa) 'Balboa', 
+                                                         if (!is.na(solo) && solo) 'Solo'), 
+                                                   collapse = ' + ')}**"),
+         cc = glue::glue("You have been confirmed for: **{paste(c(if (!is.na(lindy_in) && lindy_in) 'Lindy', 
+                                                         if (!is.na(balboa_in) && balboa_in) 'Balboa', 
+                                                         if (!is.na(solo_in) && solo_in) 'Solo'), 
+                                                   collapse = ' + ')}**"),
+    base_price = case_when(
+      !is.na(lindy_in) && lindy_in & (is.na(balboa_in) | !balboa_in) & (is.na(solo_in) | !solo_in) ~ 195,
+      !is.na(lindy_in) && lindy_in & !is.na(balboa_in) && balboa_in & (is.na(solo_in) | !solo_in) ~ 250,
+      !is.na(lindy_in) && lindy_in & (is.na(balboa_in) | !balboa_in) & !is.na(solo_in) && solo_in ~ 250,
+      !is.na(lindy_in) && lindy_in & !is.na(balboa_in) && balboa_in & !is.na(solo_in) && solo_in ~ 330,
+      (is.na(lindy_in) | !lindy_in) & !is.na(balboa_in) && balboa_in & (is.na(solo_in) | !solo_in) ~ 105,
+      (is.na(lindy_in) | !lindy_in) & !is.na(balboa_in) && balboa_in & (!is.na(solo_in) | solo_in) ~ 250,
+      TRUE ~ NA_real_
+    ),
+    wanted = sum(lindy,balboa,solo,na.rm=T),  # Count how many styles they wanted
+    admitted = sum(lindy_in,balboa_in,solo_in, na.rm = T),
+    status = case_when(
+      wanted == admitted ~ "Confirmed",
+      admitted > 0 ~ "Partially confirmed",
+      TRUE ~ "Waitlist"
+    ),
+
+    tshirt_price = ifelse(status != "Waitlist" & !is.na(tshirt) & tshirt == "Yes, of course!", 25, 0),
+    
+    tp = coalesce(base_price,0) + coalesce(tshirt_price,0),
+    
+    tpa = glue("{coalesce(base_price,0)}€ {if (tshirt_price > 0) glue(' + {coalesce(tshirt_price,0)}€') else ''}"),
+    
+    total_price = glue("Total price: **{coalesce(tp,0)}€** ({tpa})")
+  )
+
+  
+  email <- reminder_email(prep_data$name, 
+             var_registration = prep_data$rr,
+             var_confirmation = if_else(prep_data$status == "Waitlist", "You are confirmed for: **-**", prep_data$cc),
+             var_tshirt_answer = prep_data$tshirt_size,
+             var_confirmed = prep_data$status,
+             var_total_price = if_else(prep_data$email == "egarcia24fs@gmail.com", 
+                                       "Total price: **275€** (250€ + 25€, Balboa is on us)",
+                                       prep_data$total_price),
+             xx = prep_data$Code) 
+  
+    email_to_send <- compose_email(
+      body = md(email),
+      title = "Midnight Sun Swing - Payment Reminder",
+      footer = "Midnight Sun Swing"
+      )
+    
+    if(length(prep_data$email)>1) {stop()}
+    
+    # smtp_send(
+    #   email_to_send,
+    #   to = prep_data$email,
+    #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+    #   subject = "Midnight Sun Swing - Payment reminder",
+    #   credentials = creds_file(file = "~/Documents/gmail_creds")
+    # )
+    cat(ii, "/", nrow(payment_reminder), "\n")
+    Sys.sleep(2)
+}
+
+```

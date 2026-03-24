@@ -1,0 +1,86 @@
+---
+title: "tshirts_2025"
+format: html
+---
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+library(glue)
+
+rm(list = ls())
+
+gs4_auth(email = "vicent.boned.11@gmail.com")
+responses_2025 <- "https://docs.google.com/spreadsheets/d/1SeBYtYHBqXbiMc3HsSY7Y5kSSMDBp1SE8xZIm9_qJig/edit?resourcekey=&gid=1332098813#gid=1332098813"
+
+final_df <- read_sheet(ss = responses_2025, sheet = "final_tally")
+clean_response_df <- read_sheet(responses_2025, sheet = "clean_groups_df")
+```
+
+<!-- ```{r TSHIRTS PAID} -->
+<!-- final_df %>%  -->
+<!--   rowwise() %>%  -->
+<!--   filter(any(coalesce(lindy_in,F), coalesce(balboa_in,F), coalesce(solo_in,F))) %>%  -->
+<!--   inner_join(select(clean_response_df, email, tshirt_size)) %>%  -->
+<!--   group_by(tshirt_size) %>%  -->
+<!--   summarise(people = n_distinct(email)) %>%  -->
+<!--   write_sheet(ss = responses_2025, sheet = "tshirts_official") -->
+<!-- ``` -->
+
+```{r GROUPS CONFIRMED}
+balboa_summary_df <- final_df %>%
+  filter(balboa_in) %>% left_join(clean_response_df) %>% 
+  group_by(balboa_role, balboa_level) %>% 
+  summarise(attendees = n())  %>% 
+  pivot_wider(names_from = balboa_role, values_from = attendees) 
+
+googlesheets4::range_write(ss = responses_2025,
+                           data = balboa_summary_df,
+                           sheet = "Groups summary",
+                           range = "A2", reformat = F)
+
+lindy_summary_df <- final_df %>% 
+  filter(lindy_in) %>% inner_join(clean_response_df) %>% 
+  group_by(lindy_role, lindy_level) %>% 
+  summarise(attendees = n())  %>% 
+  pivot_wider(names_from = lindy_role, values_from = attendees) 
+s
+googlesheets4::range_write(ss = responses_2025,
+                           data = lindy_summary_df,
+                           sheet = "Groups summary",
+                           range = "E2", reformat = F)
+
+solo_summary_df <- final_df %>% 
+  filter(solo_in) %>%  inner_join(clean_response_df) %>% 
+  summarise(attendees = n())
+
+googlesheets4::range_write(ss = responses_2025,
+                           data = solo_summary_df,
+                           sheet = "Groups summary",
+                           range = "I2", reformat = F)
+```
+
+```{r MONEY / PAYERS}
+final_df %>% 
+  rowwise() %>% 
+  filter(any(coalesce(lindy_in,F), coalesce(balboa_in,F), coalesce(solo_in,F))) %>% 
+  inner_join(clean_response_df) %>% 
+  filter(!email %in% c("vicent.boned.11@gmail.com", "karkulahti.april@gmail.com", "sauli.anetjarvi@gmail.com",
+                       "latvarto@gmail.com", "nicholas.r.tangel@gmail.com", "pinja.juvonen@gmail.com")) %>% 
+  group_by(pass) %>% 
+  summarise(attendees = n_distinct(email))
+```
+
+
+```{r VENUE}
+final_df %>% 
+  rowwise() %>% 
+  filter(any(coalesce(lindy_in,F), coalesce(solo_in,F))) %>% 
+  inner_join(clean_response_df) %>% ungroup() %>% 
+  summarise(attendees = n_distinct(email))
+```
+
+
+
+

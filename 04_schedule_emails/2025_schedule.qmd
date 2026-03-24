@@ -1,0 +1,206 @@
+---
+title: "2025_schedule_email"
+format: html
+---
+
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+ss  <- "https://docs.google.com/spreadsheets/d/1SeBYtYHBqXbiMc3HsSY7Y5kSSMDBp1SE8xZIm9_qJig/edit?resourcekey=&gid=1332098813#gid=1332098813"
+```
+
+```{r EMAIL}
+img_string <- add_image(file = "~/Documents/GitHub/midnightsun_swing/midnightsunswing.jpeg")
+
+confirmation_text <- function(your_information, name){
+  
+  str_glue("**Welcome to Midnight Sun Swing - 2nd Edition!**
+
+Hello **{name}**, we hope that you are as thrilled as we are to spend a fantastic summer weekend in Helsinki with a lot of classes and two nights of non-stop dancing! 
+
+Here you have all the information needed:
+
+**Your information:**
+
+{your_information}
+
+
+**Classes Information:**
+
+-   **Lindy Hop** will have 4 classes of 60 minutes and they will be at [Hietsun Paviljonki](https://maps.app.goo.gl/bxYwcnodgNHN8E6W7) and [Helsinki German School](https://maps.app.goo.gl/mKZVPrhF6hZWwYhk7)
+    
+-   **Solo Jazz** will have 2 classes of 90 min at [Hietsun Paviljonki](https://maps.app.goo.gl/bxYwcnodgNHN8E6W7)
+
+-   **Balboa** will have 2 classes of 90 min at [Black Pepper Swing ](https://maps.app.goo.gl/VBj2rpWGXZst76Du5): Door code: 1991#
+
+- Doors will open 15 min before the classes start, please be on time to respect your colleagues and teachers
+
+- Find the schedule attached to this email, or in our [instagram feed](https://www.instagram.com/midnightsun_swing/) in the coming days
+
+
+**Parties Information:**
+
+-   We will start on Thursday with a **Fast Swing DJ party**, dedicated to all the Balboa dancers and the  bravest lindy hoppers. The party will start after the Balboa classes, from 20h at Black Pepper Swing
+
+
+-   On Friday, the party will **start at 19.30h** with an amazing culture talk open for all Lindy or Solo participants by [Bobby White](https://swungover.wordpress.com/), where we'll watch some clips and learn about the Harvest Moon Ball. After that *Professor Cunningham and his Old School Band* will make us swing until the sunset (or sunrise?)
+
+-   On Saturday the party will **start at 20.30h** so you can all get a longer rest before another night of swinging tunes by the *Professor Cunningham and his Old School Band*
+
+-   On Sunday, we will have a farewall social dance with DJ, but to spice things up we have two special treats: We will have another culture talk / QA with Ursula Hicks and we will get to dance to the tunes of DJ Bobby White. **Starting at 16.30h**
+
+-   Friday, Saturday and Sunday parties will be at Hietsun Paviljonki, which will remain open after classes in case you want to stay there until the party starts
+
+
+**Other important information:**
+
+-   The entrance to Hietsu will be on the beach side during the parties
+
+-   This year we will use the small room as cloakroom. Please do not bring your backpacks to the dance floor / corridor.
+
+-   There will be a coffee corner, where you can get coffee and home made snacks, but you can bring your own! In case you want to buy from us, we accept cash and Mobile Pay
+
+-   We recommend you bring a refillable water bottle with you, and (maybe) swimsuit and towel for the **#midnightsunswim**
+
+**Social Media**
+
+-   Remember to follow us on social media and to share your memories with us! [@midnightsunswing](https://www.instagram.com/midnightsun_swing/)
+
+**Code of conduct and safe space**
+
+-   We want to make this weekend safe and enjoyable for everyone and we expect that you will follow the [code of conduct](https://www.midnightsunswing.fi/code-of-conduct/) of our Helsinki scene and act respectfully to everyone
+
+-   If you need advice or come across any unwanted behaviour you can contact any of the organisers personally or via [email](midnightsunswing@gmail.com) or call our safe space person April Karkulahti (+358505231534)
+
+-   There will be a photographer in the event, [Marina](https://www.instagram.com/nina__capri/) and the photos taken may be published on our social media and used to promote our future events. If you do not wish to appear in any of the photos please let us or her know during the weekend
+
+We wish everyone a joyful and unforgettable festival weekend!
+
+If you have any further questions don’t hesitate to reach us by email, Facebook or Instagram.
+
+Cheers from the Midnight Sun Swing Team
+
+{img_string}"
+  )
+}
+
+generate_email_details_confirmation <- function(lindy_group, balboa_group, solo_group, tshirt_answer, payment_status) {
+  str_glue("- Your Lindy group: **{dplyr::coalesce(lindy_group, '-')}**
+    - Your Balboa group: **{dplyr::coalesce(balboa_group, '-')}**
+    - Your Solo group: **{dplyr::coalesce(solo_group, '-')}**
+    - T-shirt: **{dplyr::coalesce(tshirt_answer, '-')}**
+    - Payment status: **{dplyr::coalesce(payment_status, '-')}**")
+}
+```
+
+
+```{r DATA PREP}
+adva_leaders <- read_sheet(ss, sheet = "Lindy Adv A (print)",range = "A2:F30", col_names = T)
+adva_followers <- read_sheet(ss, sheet = "Lindy Adv A (print)",range = "H2:M30", col_names = T)
+advb_leaders <- read_sheet(ss, sheet = "Lindy Adv B (print)",range = "A2:F30", col_names = T)
+advb_followers <- read_sheet(ss, sheet = "Lindy Adv B (print)",range = "H2:M30", col_names = T)
+int_leaders <- read_sheet(ss, sheet = "Lindy Int (print)",range = "A2:F30", col_names = T)
+int_followers <- read_sheet(ss, sheet = "Lindy Int (print)",range = "H2:M30", col_names = T)
+intadv_leaders <- read_sheet(ss, sheet = "Lindy Int - Adv (print)",range = "A2:F30", col_names = T)
+intadv_followers <- read_sheet(ss, sheet = "Lindy Int - Adv (print)",range = "H2:M30", col_names = T)
+balboaadv_leaders <- read_sheet(ss, sheet = "Balboa Adv (print)",range = "A2:F30", col_names = T)
+balboaadv_followers <- read_sheet(ss, sheet = "Balboa Adv (print)",range = "H2:M30", col_names = T)
+balboint_leaders <- read_sheet(ss, sheet = "Balboa Int (print)",range = "A2:F30", col_names = T)
+balboint_followers <- read_sheet(ss, sheet = "Balboa Int (print)",range = "H2:M30", col_names = T)
+
+final_tally <- read_sheet(ss, sheet = "final_tally")
+clean_groups_df <- read_sheet(ss, sheet = "clean_groups_df")
+```
+
+
+```{r DATA PREP 2}
+out <- adva_leaders %>% mutate(group = "Advanced A",
+                        role = "Leader") %>% 
+  union(adva_followers %>% mutate(group = "Advanced A",
+                                  role = "Follower")) %>% 
+  union(advb_leaders %>% mutate(group = "Advanced B",
+                                role = "Leader")) %>% 
+  union(advb_followers %>% mutate(group = "Advanced B",
+                                  role = "Follower")) %>% 
+  union(int_leaders %>% mutate(group = "Intemediate",
+                                        role = "Leader")) %>% 
+  union(int_followers %>% mutate(group = "Intermediate",
+                                          role = "Follower")) %>% 
+  union(intadv_leaders %>% mutate(group = "Intemediate Advanced",
+                                        role = "Leader")) %>% 
+  union(intadv_followers %>% mutate(group = "Intermediate Advanced",
+                                          role = "Follower"))  %>% 
+  select(email, `Last Name`, Name, lindy_group = group, role, `T-shirt`, Unpaid)
+
+out_balboa <- balboaadv_leaders %>% mutate(group = "Balboa Advanced",
+                                        role = "Leader") %>% 
+  union(balboaadv_followers %>% mutate(group = "Balboa Advanced",
+                                          role = "Follower")) %>% 
+  union(balboint_leaders %>% mutate(group = "Balboa Intemediate",
+                                        role = "Leader")) %>% 
+  union(balboint_followers %>% mutate(group = "Balboa Intermediate",
+                                          role = "Follower"))  %>% 
+  select(email,`Last Name`, Name, balboa_group = group, balboa_role = role, `T-shirt`, Unpaid)
+
+solo <- read_sheet(ss, sheet = "Solo Jazz") %>% 
+  filter(solo_in) %>% 
+  select(email) %>% mutate(solo_group = "Solo Jazz")
+
+
+aux <- out %>% 
+  full_join(out_balboa, by = c("email","Last Name", "Name", "Unpaid","T-shirt"), relationship = "many-to-many") %>% 
+  full_join(solo, by = "email") %>% 
+  filter(!is.na(email))
+
+aux %>% 
+  # left_join(select(clean_groups_df, email, lastname), by = "email") %>% 
+  select(`Last Name`, Name, lindy_group, role, balboa_group, balboa_role, solo_group, `T-shirt`) %>%
+  mutate(solo = if_else(!is.na(solo_group), "Solo", "")) %>% 
+  write_sheet(ss, sheet = "list_print2")
+
+# aux %>% View()
+```
+
+
+
+
+```{r DATA PREP}
+for(ii in 1:nrow(aux)) {
+  email <- confirmation_text(
+    generate_email_details_confirmation(lindy_group = aux$lindy_group[ii],
+                                    balboa_group = aux$balboa_group[ii],
+                                    solo_group = aux$solo_group[ii],
+                                    tshirt_answer = aux$`T-shirt`[ii], 
+                                    payment_status = if_else(!is.na(aux$Unpaid[ii]) , "Pending", "Confirmed")), aux$Name[ii]
+    )
+
+  email_to_send <- compose_email(
+    body = md(email),
+    title = "Welcome to Midnight Sun Swing",
+    footer = "Midnight Sun Swing"
+    )
+  
+  email_to_send_with_attachments <- add_attachment(
+    email_to_send,
+    file = "MNS - Schedule - 2025 - mobile.pdf",content_type = "pdf"
+  ) %>% add_attachment(file = "MNS - Schedule - 2025.pdf", content_type = "pdf")
+
+  email_to_send_with_attachments
+
+  # smtp_send(
+  #   email_to_send_with_attachments,
+  #   to = aux$email[ii],
+  #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+  #   subject = "MSS2025 - Schedule and Information",
+  #   credentials = creds_file(file = "~/Documents/gmail_creds")
+  # )
+  
+  
+  cat("Schedule email:", ii, "/", nrow(aux), "\n")
+  Sys.sleep(2)
+}
+
+```
+

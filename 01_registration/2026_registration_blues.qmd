@@ -1,0 +1,658 @@
+---
+title: "MSS 2026 Blues Registration Processing"
+format: html
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+rm(list = ls())
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(here)
+library(googlesheets4)
+
+source(here::here("R", "config.R"))
+source(here::here("R", "firestore_api.R"))
+
+# Fixed timestamp for the entire run — ensures hold-period logic is deterministic
+# within a single execution (no drift from Sys.time() called at different points)
+RUN_TIMESTAMP <- Sys.time()
+# Blues uses its own sheet — no connection to Lindy/Solo
+BLUES_SHEET <- GOOGLE_SHEETS$registrations_2026_blues
+cat("Run timestamp:", format(RUN_TIMESTAMP, "%Y-%m-%d %H:%M:%S %Z"), "\n")
+```
+
+## Load Registrations from Firebase
+
+```{r}
+#| label: load-data
+
+df_raw <- fn_get_registrations(filters = list(pass = "blues_workshop"))
+write_sheet(df_raw, ss = BLUES_SHEET, "raw_data_blues")
+```
+
+## Load Previous State (for idempotency & state-diff)
+
+```{r}
+#| label: load-previous-state
+
+# Try to read the previous final_tally from Google Sheets.
+# This is the source of truth for who was already CONFIRMED / WAITLIST / ON_HOLD.
+# If it doesn't exist yet (first run), we start with an empty frame.
+prev_tally <- tryCatch(
+  read_sheet(BLUES_SHEET, sheet = "blues_final_tally"),
+  error = function(e) {
+    message("No previous blues_final_tally found — first run.")
+    tibble(
+      email         = character(),
+      prev_status   = character(),
+      prev_blues_in = logical()
+    )
+  }
+)
+
+# Keep only the columns we need for comparison
+if (nrow(prev_tally) > 0 && "status" %in% names(prev_tally)) {
+  prev_tally <- prev_tally |>
+    select(
+      email,
+      prev_status   = status,
+      prev_blues_in = any_of("blues_in")
+    ) |>
+    mutate(
+      prev_blues_in = coalesce(as.logical(prev_blues_in), FALSE),
+      prev_status = coalesce(prev_status, "UNKNOWN")
+    )
+} else {
+  prev_tally <- tibble(
+    email         = character(),
+    prev_status   = character(),
+    prev_blues_in = logical()
+  )
+}
+
+cat("Previous tally rows:", nrow(prev_tally), "\n")
+```
+
+## Clean and Prepare Data
+
+```{r}
+#| label: clean-data
+
+# Firebase schema columns:
+# name, email, pass, role, partner_email, level, created_at,
+# payment_status, amount_cents, id, stripe_* fields
+
+df_clean <- df_raw |>
+  filter(!is.na(email) & email != "") |>
+  filter(pass == "blues_workshop") |>
+  mutate(
+    created_at = as.POSIXct(created_at),
+    name = str_to_title(name),
+    email = str_to_lower(email),
+    partner_email = str_to_lower(coalesce(partner_email, "")),
+    level = str_to_lower(level),
+    # Standardize partner field (guard against partner_email == own email)
+    partner_email = if_else(partner_email == email, "", partner_email),
+    has_partner = partner_email != "" & !is.na(partner_email)
+  ) |>
+  arrange(created_at) |>
+  # Deduplicate: keep the latest registration per email
+  # (handles re-submissions; latest row has the most up-to-date preferences)
+  group_by(email) |>
+  slice_max(created_at, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(-c(stripe_payment_method_id)) |>
+  relocate(created_at, id, email, name, pass, role, level, has_partner, partner_email) |>
+  arrange(created_at)
+
+# Report duplicates removed
+n_before_dedup <- df_raw |> filter(!is.na(email) & email != "", pass == "blues_workshop") |> nrow()
+cat("Registrations before dedup:", n_before_dedup,
+    "| after dedup:", nrow(df_clean),
+    "| removed:", n_before_dedup - nrow(df_clean), "duplicates\n")
+
+# Show pass distribution
+df_clean |> count(role, level) |>
+  pivot_wider(names_from = role, values_from = n, values_fill = 0)
+
+write_sheet(df_clean, ss = BLUES_SHEET, "blues_clean_data")
+```
+
+## Define Quotas
+
+```{r}
+#| label: quotas
+
+# Quotas derived from the single source of truth in config.R → GROUP_CAPACITIES
+BLUES_QUOTAS <- tibble(
+  level = "intermediate_plus",
+  quota = GROUP_CAPACITIES$blues_intermediate_plus
+)
+
+# Hold period: days to wait for a listed partner to register before treating as single
+PARTNER_HOLD_DAYS <- 3
+
+cat("Blues quotas:\n")
+print(BLUES_QUOTAS)
+cat("Hold period:", PARTNER_HOLD_DAYS, "days\n")
+```
+
+## Helper Functions for Matching
+
+```{r}
+#| label: helper-functions
+
+#' Match leaders and followers for a dance track
+#'
+#' @param df Data frame with registrations for a specific track
+#' @param quota_df Data frame with level and quota columns (or single number for all levels)
+#' @param hold_days Number of days to hold a spot for an unmatched partner before
+#'   treating the registrant as a single. 0 = no hold (immediate single matching).
+#' @param run_ts Fixed timestamp for this run (avoids Sys.time() drift)
+#' @param prev_pairs Optional tibble of ALL pairs from the previous run.
+#'   Eligible pairs are locked: their members are removed from matching pools
+#'   and they receive priority pair_numbers so they can never be pushed out
+#'   of the quota by new registrations.
+#' @return List with `pairs` (matched pairs with eligibility) and `on_hold`
+#'   (registrants still waiting for their partner within the hold period)
+fn_match_partners <- function(df, quota_df, hold_days = 0,
+                              run_ts = RUN_TIMESTAMP,
+                              prev_pairs = NULL) {
+
+  # Separate leaders and followers
+  leaders <- df |>
+    filter(role == "leader") |>
+    select(created_at, email, level, has_partner, partner_email)
+
+  followers <- df |>
+    filter(role == "follower") |>
+    select(created_at, email, level, has_partner, partner_email)
+
+  # ── Step 0: Lock ALL previously eligible pairs (couples + singles) ──
+  if (!is.null(prev_pairs) && nrow(prev_pairs) > 0) {
+    locked_pairs <- prev_pairs |> filter(eligible)
+    locked_emails <- c(
+      locked_pairs$email_leader[!is.na(locked_pairs$email_leader)],
+      locked_pairs$email_follower[!is.na(locked_pairs$email_follower)]
+    )
+    leaders   <- leaders   |> filter(!email %in% locked_emails)
+    followers <- followers |> filter(!email %in% locked_emails)
+
+    cat("  Locked", nrow(locked_pairs), "previously eligible pairs (",
+        sum(locked_pairs$is_couple), "couples,",
+        sum(!locked_pairs$is_couple), "singles pairs )\n")
+  } else {
+    locked_pairs <- NULL
+  }
+
+  # ── Step 1: Match registered couples (mutual partner reference + same level) ──
+  couples <- leaders |>
+    filter(has_partner) |>
+    inner_join(
+      followers |> filter(has_partner),
+      by = c("partner_email" = "email", "level" = "level"),
+      suffix = c("_leader", "_follower")
+    ) |>
+    filter(email == partner_email_follower) |>
+    select(
+      email_leader = email,
+      email_follower = partner_email,
+      level,
+      created_at_leader,
+      created_at_follower
+    ) |>
+    mutate(is_couple = TRUE)
+
+  # ── Step 2: Unmatched partners ──
+  unmatched_leaders <- leaders |>
+    filter(has_partner) |>
+    anti_join(couples, by = c("email" = "email_leader"))
+
+  unmatched_followers <- followers |>
+    filter(has_partner) |>
+    anti_join(couples, by = c("email" = "email_follower"))
+
+  # ── Step 2b: Hold period ──
+  if (hold_days > 0) {
+    hold_cutoff <- run_ts - as.difftime(hold_days, units = "days")
+
+    on_hold_leaders   <- unmatched_leaders  |> filter(created_at > hold_cutoff)
+    expired_leaders   <- unmatched_leaders  |> filter(created_at <= hold_cutoff)
+    on_hold_followers <- unmatched_followers |> filter(created_at > hold_cutoff)
+    expired_followers <- unmatched_followers |> filter(created_at <= hold_cutoff)
+
+    on_hold <- bind_rows(
+      on_hold_leaders   |> mutate(role = "leader"),
+      on_hold_followers |> mutate(role = "follower")
+    )
+  } else {
+    expired_leaders   <- unmatched_leaders
+    expired_followers <- unmatched_followers
+    on_hold <- tibble(
+      created_at    = as.POSIXct(character()),
+      email         = character(),
+      level         = character(),
+      has_partner   = logical(),
+      partner_email = character(),
+      role          = character()
+    )
+  }
+
+  # ── Step 3: Build singles pool ──
+  single_leaders <- leaders |>
+    filter(!has_partner) |>
+    bind_rows(expired_leaders |> select(-partner_email)) |>
+    arrange(created_at)
+
+  single_followers <- followers |>
+    filter(!has_partner) |>
+    bind_rows(expired_followers |> select(-partner_email)) |>
+    arrange(created_at)
+
+  # ── Step 3b: Match new singles by index within each level ──
+  single_leaders <- single_leaders |>
+    group_by(level) |> arrange(created_at) |> mutate(idx = row_number()) |> ungroup()
+  single_followers <- single_followers |>
+    group_by(level) |> arrange(created_at) |> mutate(idx = row_number()) |> ungroup()
+
+  non_couples <- single_leaders |>
+    full_join(single_followers, by = c("idx", "level"), suffix = c("_leader", "_follower")) |>
+    select(email_leader, email_follower, level, created_at_leader, created_at_follower) |>
+    mutate(is_couple = FALSE)
+
+  # ── Step 4: Combine new couples + new singles ──
+  new_pairs <- bind_rows(couples, non_couples) |>
+    mutate(
+      created_at_pair = pmax(created_at_leader, created_at_follower, na.rm = TRUE),
+      is_locked = FALSE
+    )
+
+  # ── Step 5: Combine locked + new ──
+  if (!is.null(locked_pairs) && nrow(locked_pairs) > 0) {
+    locked_for_combine <- locked_pairs |>
+      mutate(
+        created_at_pair = pmax(created_at_leader, created_at_follower, na.rm = TRUE),
+        is_locked = TRUE
+      ) |>
+      select(email_leader, email_follower, level,
+             created_at_leader, created_at_follower,
+             is_couple, created_at_pair, is_locked)
+
+    all_pairs <- bind_rows(locked_for_combine, new_pairs)
+  } else {
+    all_pairs <- new_pairs
+  }
+
+  # Number pairs
+  all_pairs <- all_pairs |>
+    group_by(level) |>
+    arrange(!is_locked,
+            is.na(email_leader) | is.na(email_follower),
+            created_at_pair,
+            .by_group = TRUE) |>
+    mutate(pair_number = row_number()) |>
+    ungroup()
+
+  # Apply quotas
+  if (is.data.frame(quota_df)) {
+    all_pairs <- all_pairs |>
+      left_join(quota_df, by = "level") |>
+      mutate(
+        eligible = is_locked |
+          (pair_number <= quota &
+           !is.na(email_leader) & !is.na(email_follower))
+      )
+  } else {
+    all_pairs <- all_pairs |>
+      mutate(
+        quota = quota_df,
+        eligible = is_locked |
+          (pair_number <= quota &
+           !is.na(email_leader) & !is.na(email_follower))
+      )
+  }
+
+  list(pairs = all_pairs, on_hold = on_hold)
+}
+
+#' Convert paired data to individual eligibility
+#'
+#' @param pairs_df Data frame with matched pairs
+#' @param track_name Name of the track (for column naming)
+#' @return Data frame with email and eligibility status
+fn_pairs_to_individual <- function(pairs_df, track_name) {
+  col_name <- paste0(track_name, "_in")
+
+  pairs_df |>
+    select(email_leader, email_follower, eligible) |>
+    pivot_longer(
+      cols = c(email_leader, email_follower),
+      names_to = "role",
+      values_to = "email"
+    ) |>
+    filter(!is.na(email)) |>
+    group_by(email) |>
+    summarise(!!col_name := any(eligible), .groups = "drop")
+}
+```
+
+## Process Blues Registrations
+
+```{r}
+#| label: blues-processing
+
+df_blues <- df_clean |>
+  select(created_at, email, role, level, has_partner, partner_email)
+
+# Load ALL previous pairs from Google Sheets (if they exist).
+prev_blues_pairs <- tryCatch(
+  read_sheet(BLUES_SHEET, sheet = "blues_pairs_locked"),
+  error = function(e) {
+    message("No previous blues_pairs_locked sheet — first run.")
+    NULL
+  }
+)
+
+# Match partners for Blues (passing previous pairs for stability)
+blues_result <- fn_match_partners(
+  df_blues,
+  quota_df  = BLUES_QUOTAS,
+  hold_days = PARTNER_HOLD_DAYS,
+  run_ts    = RUN_TIMESTAMP,
+  prev_pairs = prev_blues_pairs
+)
+blues_pairs   <- blues_result$pairs
+blues_on_hold <- blues_result$on_hold
+
+# Summary by level
+blues_summary <- blues_pairs |>
+  group_by(level) |>
+  summarise(
+    complete_pairs = sum(!is.na(email_leader) & !is.na(email_follower)),
+    eligible_pairs = sum(eligible, na.rm = TRUE),
+    quota = first(quota),
+    .groups = "drop"
+  )
+
+print(blues_summary)
+
+# Get individual eligibility
+blues_eligible <- fn_pairs_to_individual(blues_pairs, "blues")
+
+# ── Monotonic safety net: never demote a previously confirmed blues participant ──
+if (nrow(prev_tally) > 0) {
+  blues_before <- blues_eligible
+  blues_eligible <- blues_eligible |>
+    left_join(prev_tally |> select(email, prev_blues_in), by = "email") |>
+    mutate(blues_in = coalesce(blues_in, FALSE) | coalesce(prev_blues_in, FALSE)) |>
+    select(email, blues_in)
+
+  n_saved <- sum(blues_eligible$blues_in & !coalesce(blues_before$blues_in, FALSE))
+  if (n_saved > 0) {
+    cat("  ⚠ Monotonic safety net saved", n_saved, "blues participants from demotion\n")
+  }
+}
+
+# Persist locked-in pairs for next run
+write_sheet(blues_pairs, ss = BLUES_SHEET, sheet = "blues_pairs_locked")
+```
+
+## Final Tally - Combine All Results
+
+```{r}
+#| label: final-tally
+
+# Create on-hold indicator from blues processing
+blues_on_hold_emails <- if (nrow(blues_on_hold) > 0) {
+  blues_on_hold |> distinct(email) |> mutate(is_on_hold = TRUE)
+} else {
+  tibble(email = character(), is_on_hold = logical())
+}
+
+# Combine all eligibility results (Blues only — no Solo Jazz)
+final_tally <- df_clean |>
+  select(
+    id, created_at, email, name, pass, role, level,
+    has_partner, partner_email,
+    payment_status, amount_cents
+  ) |>
+  left_join(blues_eligible, by = "email") |>
+  left_join(blues_on_hold_emails, by = "email") |>
+  mutate(
+    # Determine overall status (Blues only)
+    status = case_when(
+      coalesce(is_on_hold, FALSE) ~ "ON_HOLD",
+      coalesce(blues_in, FALSE) ~ "CONFIRMED",
+      TRUE ~ "WAITLIST"
+    )
+  )
+
+# Sanity check
+dup_emails <- final_tally |> count(email) |> filter(n > 1)
+if (nrow(dup_emails) > 0) {
+  warning("DUPLICATE EMAILS in final_tally: ", paste(dup_emails$email, collapse = ", "))
+}
+stopifnot("final_tally has duplicate emails!" = nrow(dup_emails) == 0)
+
+# Status summary
+status_summary <- final_tally |>
+  count(status) |>
+  arrange(desc(n))
+
+cat("\n=== FINAL STATUS SUMMARY ===\n")
+print(status_summary)
+
+cat("\n=== DETAILED BREAKDOWN ===\n")
+final_tally |>
+  group_by(status) |>
+  summarise(
+    count = n(),
+    blues_in = sum(blues_in, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  print()
+```
+
+## State Diff — Previous vs New
+
+```{r}
+#| label: state-diff
+
+if (nrow(prev_tally) > 0) {
+  state_diff <- final_tally |>
+    select(email, name, role, level, status, blues_in) |>
+    left_join(prev_tally, by = "email", suffix = c("", "_prev")) |>
+    mutate(
+      prev_status  = coalesce(prev_status, "NEW"),
+      status_changed = status != prev_status,
+      transition = if_else(
+        status_changed,
+        paste0(prev_status, " -> ", status),
+        "no change"
+      )
+    )
+
+  promotions <- state_diff |>
+    filter(
+      status_changed,
+      prev_status %in% c("WAITLIST", "ON_HOLD", "NEW"),
+      status == "CONFIRMED"
+    ) |>
+    select(name, email, role, level, transition)
+
+  cat("\n=== PROMOTIONS (need confirmation email) ===\n")
+  if (nrow(promotions) > 0) {
+    print(promotions, n = 100)
+  } else {
+    cat("No promotions since last run.\n")
+  }
+
+  demotions <- state_diff |>
+    filter(
+      status_changed,
+      prev_status == "CONFIRMED",
+      status %in% c("WAITLIST", "ON_HOLD")
+    ) |>
+    select(name, email, role, level, transition)
+
+  if (nrow(demotions) > 0) {
+    cat("\n⚠ WARNING: DEMOTIONS DETECTED (should not happen!) ===\n")
+    print(demotions, n = 100)
+  }
+
+  new_regs <- state_diff |>
+    filter(prev_status == "NEW") |>
+    select(name, email, role, level, status)
+
+  cat("\n=== NEW REGISTRATIONS SINCE LAST RUN ===\n")
+  if (nrow(new_regs) > 0) {
+    print(new_regs, n = 100)
+  } else {
+    cat("No new registrations.\n")
+  }
+
+  cat("\n=== TRANSITION SUMMARY ===\n")
+  state_diff |>
+    count(transition) |>
+    arrange(desc(n)) |>
+    print()
+
+} else {
+  cat("First run — no previous state to compare against.\n")
+}
+```
+
+## Write Blues Levels to Google Sheets
+
+```{r}
+#| label: write-levels-to-sheets
+
+blues_pairs_display <- blues_pairs |>
+  left_join(df_clean |> select(email, name, payment_status), by = c("email_leader" = "email")) |>
+  rename(leader_name = name, payment_status_leader = payment_status) |>
+  left_join(df_clean |> select(email, name, payment_status), by = c("email_follower" = "email")) |>
+  rename(follower_name = name, payment_status_follower = payment_status) |>
+  mutate(
+    leader_paid = coalesce(str_to_lower(payment_status_leader) == "captured" | str_detect(str_to_lower(payment_status_leader), "paid"), FALSE),
+    follower_paid = coalesce(str_to_lower(payment_status_follower) == "captured" | str_detect(str_to_lower(payment_status_follower), "paid"), FALSE)
+  ) |>
+  select(level, pair_number, leader_name, leader_email = email_leader, leader_paid,
+         created_at_leader,
+         follower_name, follower_email = email_follower, follower_paid,
+         is_couple, eligible, created_at_follower) |>
+  arrange(level, pair_number)
+
+levels_to_write <- list(
+  "Blues Intermediate+" = "intermediate_plus"
+)
+
+for (sheet_name in names(levels_to_write)) {
+  lvl <- levels_to_write[[sheet_name]]
+  lvl_data <- blues_pairs_display |> filter(level == lvl) |> select(-level)
+  quota_val <- BLUES_QUOTAS |> filter(level == lvl) |> pull(quota)
+
+  complete    <- sum(!is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
+  no_leader   <- sum(is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
+  no_follower <- sum(!is.na(lvl_data$leader_email) & is.na(lvl_data$follower_email))
+  spots_left  <- max(0, quota_val - complete)
+
+  summary_df <- tibble(
+    Metric = c("Quota", "Complete pairs", "Missing leaders", "Missing followers", "Spots left"),
+    Value  = c(quota_val, complete, no_leader, no_follower, spots_left)
+  )
+
+  write_sheet(summary_df, ss = BLUES_SHEET, sheet = sheet_name)
+  range_write(lvl_data, ss = BLUES_SHEET, sheet = sheet_name, range = "A4")
+
+  cat("Written sheet:", sheet_name, "—", complete, "complete pairs,", spots_left, "spots left\n")
+}
+```
+
+## Waitlist Details
+
+```{r}
+#| label: waitlist-details
+
+waitlist <- final_tally |>
+  filter(status == "WAITLIST") |>
+  mutate(waitlist_for = "Blues") |>
+  select(name, email, status, waitlist_for, level, role, has_partner, partner_email)
+
+on_hold <- final_tally |>
+  filter(status == "ON_HOLD") |>
+  select(name, email, level, role, partner_email, created_at) |>
+  mutate(
+    hold_expires = created_at + as.difftime(PARTNER_HOLD_DAYS, units = "days")
+  )
+
+cat("\n=== ON HOLD (partner has", PARTNER_HOLD_DAYS, "days to register) ===\n")
+if (nrow(on_hold) > 0) {
+  print(on_hold, n = 50)
+} else {
+  cat("No registrations currently on hold.\n")
+}
+
+cat("\n=== WAITLIST DETAILS ===\n")
+print(waitlist, n = 50)
+```
+
+## Persist Final Tally
+
+```{r}
+#| label: persist-final-tally
+
+write_sheet(final_tally, ss = BLUES_SHEET, sheet = "blues_final_tally")
+cat("Final tally written to Google Sheets (", nrow(final_tally), "rows)\n")
+cat("Run completed at:", format(RUN_TIMESTAMP, "%Y-%m-%d %H:%M:%S %Z"), "\n")
+```
+
+## Update Firebase with Results (Optional)
+
+```{r}
+#| label: update-firebase
+#| eval: false
+
+changed <- final_tally |>
+  select(id, email, status, blues_in) |>
+  left_join(prev_tally, by = "email") |>
+  mutate(
+    prev_status   = coalesce(prev_status, "NEW"),
+    prev_blues_in = coalesce(prev_blues_in, FALSE),
+    cur_blues_in  = coalesce(blues_in, FALSE)
+  ) |>
+  filter(
+    status       != prev_status |
+    cur_blues_in != prev_blues_in
+  )
+
+cat("Registrations to update:", nrow(changed), "of", nrow(final_tally), "total\n\n")
+
+if (nrow(changed) == 0) {
+  cat("Nothing to update — Firebase is already in sync.\n")
+} else {
+  for (i in seq_len(nrow(changed))) {
+    reg <- changed[i, ]
+
+    fn_update_registration(
+      doc_id = reg$id,
+      fields = list(
+        blues_in = reg$cur_blues_in,
+        status   = reg$status
+      )
+    )
+
+    cat("Updated:", reg$email, "—", reg$prev_status, "->", reg$status,
+        " | blues_in:", reg$cur_blues_in, "\n")
+    Sys.sleep(0.5)
+  }
+
+  cat("\nFirebase update complete!", nrow(changed), "registrations updated.\n")
+}
+```

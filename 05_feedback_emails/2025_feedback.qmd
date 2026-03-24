@@ -1,0 +1,66 @@
+---
+title: "2025_feedback_email"
+format: html
+---
+
+```{r}
+library(googlesheets4)
+library(blastula)
+library(tidyverse)
+
+gs4_auth(email = "vicent.boned.11@gmail.com")
+responses_2025 <- "https://docs.google.com/spreadsheets/d/1SeBYtYHBqXbiMc3HsSY7Y5kSSMDBp1SE8xZIm9_qJig/edit?resourcekey=&gid=1332098813#gid=1332098813"
+```
+
+```{r}
+img_string <- add_image(file = "~/Documents/GitHub/midnightsun_swing/midnightsunswing.jpeg")
+
+email <- str_glue("**Thank you so much for joining the 2nd Edition of the Midnight Sun Swing Festival!**
+
+Your smiles and positive energy made the whole weekend feel cozy and inviting – we couldn’t have asked for a better crowd.
+
+Huge thanks to everyone who helped out in any way 🙌  
+And special shoutout to the weather fairy for that sunny and warm weekend!
+
+**And finally, if you can spare 5 minutes to give us some feedback, it’ll help us shape future events in Helsinki even better**
+
+[FEEDBACK FORM LINK](https://forms.gle/i6mrAfj4aLFKPAjA6)
+
+Cheers from the Midnight Sun Swing Team
+
+{img_string}
+")
+```
+
+```{r}
+thanksemails <- read_sheet(responses_2025, sheet = "final_tally")
+
+emails <- thanksemails %>% select(email,(contains("_in"))) %>% pivot_longer(cols = !email) %>% 
+  filter(value) %>% select(email) %>% unique() %>% pluck("email")
+```
+
+
+```{r}
+email_to_send <- compose_email(
+    body = md(email),
+    title = "Thanks for coming to Midnight Sun Swing",
+    footer = "Midnight Sun Swing"
+    )
+
+email_to_send 
+
+batch1 <- emails[1:55]
+batch2 <- emails[56:110]
+batch3 <- emails[111:160]
+batch4 <- emails[161:213]
+
+# smtp_send(
+#   email_to_send,
+#   to = "midnightsunswing@gmail.com",
+#   bcc = batch4,
+#   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
+#   subject = "Thank you - Midnight Sun Swing",
+#   credentials = creds_file(file = "~/Documents/gmail_creds")
+#   )
+```
+

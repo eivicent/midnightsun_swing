@@ -59,7 +59,6 @@ batch4 <- thanksemails[151:185]
 # smtp_send(
 #   email_to_send,
 #   to = "midnightsunswing@gmail.com",
-#   bcc = "minna.yliollila@gmail.com",
 #   from = c("Midnight Sun Swing" = "midnightsunswing@gmail.com"),
 #   subject = "Thank you - Midnight Sun Swing",
 #   credentials = creds_file(file = "~/gmail_creds")
