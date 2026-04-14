@@ -209,7 +209,8 @@ cat("\nRegistrations with payment details loaded:", nrow(df_registrations), "row
 #   2. Have NOT already received an email for their CURRENT status
 #      (allows re-processing when status changes, e.g. WAITLIST → CONFIRMED)
 df_to_process <- df_registrations |>
-  filter(status %in% c("CONFIRMED", "PARTIAL", "WAITLIST")) |>
+  filter(status %in% c("CONFIRMED", "PARTIAL", "WAITLIST"),
+         coalesce(confirmation_email_status, "new") != "CONFIRMED") |>
   filter(
     !coalesce(as.logical(confirmation_email_sent), FALSE) |
     coalesce(confirmation_email_status, "") != status

@@ -110,7 +110,74 @@ easier to review when you run it.
 **Risk**: Low — pure refactor. Run the notebook before and after and
 compare `final_tally` output to verify identical results.
 
-### 1.3 — Unify the setup pattern
+### 1.3 — Re-charge expired pre-auths instead of falling back to bank transfer
+
+When a Stripe pre-auth expires (7 days) and the capture fails, the current
+flow sends the user bank transfer instructions. This creates manual
+reconciliation work and delays payment.
+
+**Better**: Create a new PaymentIntent using the same card, charge it
+immediately off-session. The user's card is charged without them needing
+to visit any page.
+
+**This is fully supported** because the registration website already:
+- Creates a Stripe Customer (`stripe_customer_id` in Firestore)
+- Stores the payment method (`stripe_payment_method_id` in Firestore)
+- Uses `setup_future_usage: 'off_session'` (SCA handled at registration)
+
+**Implementation**:
+
+Add `fn_create_off_session_payment()` to `R/firestore_api.R`:
+
+```r
+fn_create_off_session_payment <- function(customer_id, payment_method_id,
+                                          amount_cents) {
+  stripe_key <- fn_get_stripe_key()
+  resp <- request(paste0(STRIPE_BASE_URL, "/payment_intents")) |>
+    req_auth_basic(stripe_key, "") |>
+    req_method("POST") |>
+    req_body_form(
+      amount = amount_cents,
+      currency = "eur",
+      customer = customer_id,
+      payment_method = payment_method_id,
+      confirm = "true",
+      off_session = "true"
+    ) |>
+    req_error(is_error = function(resp) FALSE) |>
+    req_perform()
+  result <- resp_body_json(resp)
+  if (resp_status(resp) != 200) {
+    stop("Off-session payment failed: ", result$error$message)
+  }
+  message("Off-session payment succeeded: ", result$id)
+  result
+}
+```
+
+Then update the confirmation notebook's capture-failed branch:
+
+```
+Current flow:
+  capture fails → send bank transfer email
+
+New flow:
+  capture fails → attempt off-session charge with same card
+    → if charge succeeds → send "payment collected" email
+    → if charge also fails → send bank transfer email (fallback)
+```
+
+**Prerequisites**: The confirmation notebook must read `stripe_customer_id`
+and `stripe_payment_method_id` from Firestore (currently only
+`stripe_payment_intent_id` is selected in `df_firebase_slim`). Add them
+to the `select()` call.
+
+**Files changed**: `R/firestore_api.R`, `02_confirmation_emails/2026_confirmation.qmd`,
+  `02_confirmation_emails/2026_confirmation_blues.qmd`
+**Risk**: Low — the fallback to bank transfer email remains if the
+off-session charge fails. No worse than today.
+
+### 1.4 — Unify the setup pattern
 
 Every notebook starts with slightly different `library()` calls and
 `source()` patterns. Standardize them all to:
@@ -173,7 +240,7 @@ The key changes:
   config flag (`DATA_SOURCE = "firestore"` vs `DATA_SOURCE = "sheets"`)
 - Email copy comes entirely from `config.R` (already mostly true)
 
-**Depends on**: Phase 1.2 (pairing engine extracted), Phase 1.3 (setup unified)
+**Depends on**: Phase 1.2 (pairing engine extracted), Phase 1.4 (setup unified)
 
 ### 2.3 — Make Firestore the single source of truth
 
@@ -281,7 +348,8 @@ NOW (registration is live)
 ├── 0.3  Audit log in confirmation
 │
 ├── 1.1  Enable Firebase writeback chunk
-├── 1.3  Unify setup pattern
+├── 1.3  Re-charge expired pre-auths (off-session)
+├── 1.4  Unify setup pattern
 ├── 1.2  Extract pairing engine → R/pairing.R
 │
 JULY (festival happens)

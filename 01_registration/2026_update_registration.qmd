@@ -29,7 +29,7 @@ and the new **value** to set.
 
 updates <- tribble(
   ~id,                        ~field,             ~value,
-  "KSlx5Aj6No1BeUuS3QJG",            "partner_email",    "tonjebsen22@hotmail.com"
+  "4qVDgrEpoLV9PkIF1otZ",            "payment_status",    "captured"
   
 )
 
