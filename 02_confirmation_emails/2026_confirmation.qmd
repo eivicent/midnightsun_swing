@@ -10,19 +10,12 @@ execute:
 #| label: setup
 #| include: false
 
-rm(list = ls())   
-library(dplyr)
-library(tidyr)
-library(stringr)
-library(glue)
-library(purrr)
-library(blastula)
-library(googlesheets4)
-library(here)
+rm(list = ls())
 
 source(here::here("R", "config.R"))
-source(here::here("R", "firestore_api.R"))
 source(here::here("R", "helpers.R"))
+source(here::here("R", "firestore_api.R"))
+fn_setup()
 ```
 
 ## Load Registration Results
@@ -69,9 +62,16 @@ if (!"payment_status" %in% names(df_firebase)) {
 if (!"fan" %in% names(df_firebase)) {
   df_firebase$fan <- FALSE
 }
+if (!"stripe_customer_id" %in% names(df_firebase)) {
+  df_firebase$stripe_customer_id <- NA_character_
+}
+if (!"stripe_payment_method_id" %in% names(df_firebase)) {
+  df_firebase$stripe_payment_method_id <- NA_character_
+}
 
 df_firebase_slim <- df_firebase |>
-  select(id, stripe_payment_intent_id, payment_method,
+  select(id, stripe_payment_intent_id, stripe_customer_id,
+         stripe_payment_method_id, payment_method,
          confirmation_email_sent, confirmation_email_status, payment_status, fan)
 
 # ── 3. Join status with payment details ──
@@ -525,11 +525,40 @@ for (i in 1:nrow(df_to_process)) {
         payment_section <- txt_payment_card_ok
 
       } else if (prev_capture_fail) {
-        # A previous run tried to capture and failed.
-        # Send card-failed email with alternative payment instructions.
-        # To retry the capture instead, reset payment_status in Firebase first.
-        cat("  ⚠ Previous capture failed — sending card-failed instructions\n")
-        payment_section <- txt_payment_card_failed
+        # A previous run tried to capture and failed (likely expired pre-auth).
+        # Try off-session charge using the stored card before falling back
+        # to bank transfer instructions.
+        has_card_on_file <- !is.na(reg$stripe_customer_id) &&
+          reg$stripe_customer_id != "" &&
+          !is.na(reg$stripe_payment_method_id) &&
+          reg$stripe_payment_method_id != ""
+
+        off_session_ok <- FALSE
+        if (has_card_on_file) {
+          cat("  Attempting off-session charge with stored card...\n")
+          charge_amount <- reg$total_price * 100
+          off_session_ok <- tryCatch({
+            fn_create_off_session_payment(
+              customer_id       = reg$stripe_customer_id,
+              payment_method_id = reg$stripe_payment_method_id,
+              amount_cents      = charge_amount
+            )
+            TRUE
+          }, error = function(e) {
+            cat("  ⚠ Off-session charge failed: ", conditionMessage(e), "\n")
+            FALSE
+          })
+        }
+
+        if (off_session_ok) {
+          fn_update_registration(reg$id, list(payment_status = "captured"))
+          results$payment_captured <- results$payment_captured + 1L
+          cat("  ✓ Payment captured via off-session charge\n")
+          payment_section <- txt_payment_card_ok
+        } else {
+          cat("  Falling back to card-failed instructions (bank transfer)\n")
+          payment_section <- txt_payment_card_failed
+        }
 
       } else {
         # First attempt — capture the pre-authorized Stripe payment.

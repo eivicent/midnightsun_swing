@@ -110,7 +110,7 @@ easier to review when you run it.
 **Risk**: Low — pure refactor. Run the notebook before and after and
 compare `final_tally` output to verify identical results.
 
-### 1.3 — Re-charge expired pre-auths instead of falling back to bank transfer
+### 1.3 — Re-charge expired pre-auths instead of falling back to bank transfer ✅
 
 When a Stripe pre-auth expires (7 days) and the capture fails, the current
 flow sends the user bank transfer instructions. This creates manual
@@ -177,7 +177,7 @@ to the `select()` call.
 **Risk**: Low — the fallback to bank transfer email remains if the
 off-session charge fails. No worse than today.
 
-### 1.4 — Unify the setup pattern
+### 1.4 — Unify the setup pattern ✅
 
 Every notebook starts with slightly different `library()` calls and
 `source()` patterns. Standardize them all to:
@@ -348,8 +348,8 @@ NOW (registration is live)
 ├── 0.3  Audit log in confirmation
 │
 ├── 1.1  Enable Firebase writeback chunk
-├── 1.3  Re-charge expired pre-auths (off-session)
-├── 1.4  Unify setup pattern
+├── 1.3  Re-charge expired pre-auths (off-session) ✅
+├── 1.4  Unify setup pattern ✅
 ├── 1.2  Extract pairing engine → R/pairing.R
 │
 JULY (festival happens)

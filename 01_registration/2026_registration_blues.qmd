@@ -11,14 +11,11 @@ execute:
 #| include: false
 
 rm(list = ls())
-library(dplyr)
-library(tidyr)
-library(stringr)
-library(here)
-library(googlesheets4)
 
 source(here::here("R", "config.R"))
+source(here::here("R", "helpers.R"))
 source(here::here("R", "firestore_api.R"))
+fn_setup()
 
 # Fixed timestamp for the entire run — ensures hold-period logic is deterministic
 # within a single execution (no drift from Sys.time() called at different points)

@@ -11,12 +11,11 @@ execute:
 #| include: false
 
 rm(list = ls())
-library(dplyr)
-library(stringr)
-library(here)
 
 source(here::here("R", "config.R"))
+source(here::here("R", "helpers.R"))
 source(here::here("R", "firestore_api.R"))
+fn_setup()
 ```
 
 ## Define Updates

@@ -10,15 +10,12 @@ execute:
 #| label: setup
 #| include: false
 
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-library(purrr)
-library(googlesheets4)
-library(scales)
-library(here)
-
 source(here::here("R", "config.R"))
+source(here::here("R", "helpers.R"))
+fn_setup()
+
+library(ggplot2)
+library(scales)
 ```
 
 ## Load & Prepare Data

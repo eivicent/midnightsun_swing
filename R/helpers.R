@@ -12,6 +12,7 @@ fn_setup <- function() {
   library(tidyr)
   library(stringr)
   library(glue)
+  library(purrr)
   
   gs4_auth(email = AUTH_EMAIL)
 }

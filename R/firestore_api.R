@@ -433,6 +433,42 @@ fn_cancel_preauth <- function(payment_intent_id) {
  result
 }
 
+#' Create an off-session payment using a stored card
+#'
+#' When a pre-auth expires and capture fails, this creates a new PaymentIntent
+#' and charges the customer's saved card immediately (off-session).
+#' Requires that the original payment used `setup_future_usage: 'off_session'`
+#' so that SCA was handled at registration time.
+#'
+#' @param customer_id Stripe Customer ID (starts with cus_)
+#' @param payment_method_id Stripe PaymentMethod ID (starts with pm_)
+#' @param amount_cents Amount to charge in cents
+#' @return Stripe PaymentIntent object
+#' @export
+fn_create_off_session_payment <- function(customer_id, payment_method_id,
+                                          amount_cents) {
+  stripe_key <- fn_get_stripe_key()
+  resp <- request(paste0(STRIPE_BASE_URL, "/payment_intents")) |>
+    req_auth_basic(stripe_key, "") |>
+    req_method("POST") |>
+    req_body_form(
+      amount = amount_cents,
+      currency = "eur",
+      customer = customer_id,
+      payment_method = payment_method_id,
+      confirm = "true",
+      off_session = "true"
+    ) |>
+    req_error(is_error = function(resp) FALSE) |>
+    req_perform()
+  result <- resp_body_json(resp)
+  if (resp_status(resp) != 200) {
+    stop("Off-session payment failed: ", result$error$message)
+  }
+  message("Off-session payment succeeded: ", result$id)
+  result
+}
+
 #' Get Stripe PaymentIntent details
 #' 
 #' @param payment_intent_id Stripe PaymentIntent ID
