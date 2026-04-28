@@ -145,9 +145,16 @@ df_registrations <- final_tally |>
     )
   )
 
-# ── 4. Compute per-level sold-out flag from the locked pairs sheet ──
-# spots_left == 0 → level is fully booked (both roles at capacity).
-# spots_left > 0  → leader shortage (followers waiting for a leader to pair with).
+# ── 4. Compute per-level, per-role sold-out flag from the locked pairs sheet ──
+# Two distinct conditions per level:
+#   * leader_spots_left  > 0  → still recruiting leaders → follower waitlist gets
+#     the "we don't have enough leaders" message ("waitlist", with options).
+#   * leader_spots_left == 0  → leader quota filled. If a follower is still on
+#     the waitlist she can't be helped by inviting a leader (the level is full
+#     for followers too, since she's beyond the overflow), so use "sold_out".
+#   * For leaders on waitlist: leaders only end up on the waitlist when leader
+#     quota is filled, so always use "sold_out" for them.
+#
 # Lindy levels only; Solo waitlist always gets the sold-out message since the
 # "find a leader" advice never applies there.
 lindy_pairs_locked <- tryCatch(
@@ -159,15 +166,41 @@ lindy_pairs_locked <- tryCatch(
 )
 
 level_capacity <- if (!is.null(lindy_pairs_locked) && nrow(lindy_pairs_locked) > 0) {
-  lindy_pairs_locked |>
-    group_by(level) |>
-    summarise(
-      spots_left = max(0L, first(quota) - sum(!is.na(email_leader) & !is.na(email_follower), na.rm = TRUE)),
-      .groups = "drop"
-    ) |>
-    mutate(lindy_level_sold_out = spots_left == 0L)
+  # New schema (preferred): leader_eligible / follower_eligible columns.
+  # Old schema fallback: derive from complete-pair count vs quota.
+  has_role_cols <- all(c("leader_eligible", "follower_eligible") %in%
+                       names(lindy_pairs_locked))
+
+  if (has_role_cols) {
+    lindy_pairs_locked |>
+      group_by(level) |>
+      summarise(
+        confirmed_leaders   = sum(coalesce(as.logical(leader_eligible),   FALSE)),
+        confirmed_followers = sum(coalesce(as.logical(follower_eligible), FALSE)),
+        quota               = first(quota),
+        .groups = "drop"
+      ) |>
+      mutate(
+        leader_spots_left = pmax(0L, quota - confirmed_leaders),
+        # Leader quota filled → any follower still waitlisted is beyond overflow
+        # → "level is full for her too".
+        lindy_level_sold_out = leader_spots_left == 0L
+      )
+  } else {
+    lindy_pairs_locked |>
+      group_by(level) |>
+      summarise(
+        complete_pairs = sum(!is.na(email_leader) & !is.na(email_follower), na.rm = TRUE),
+        quota          = first(quota),
+        .groups = "drop"
+      ) |>
+      mutate(
+        leader_spots_left    = pmax(0L, quota - complete_pairs),
+        lindy_level_sold_out = leader_spots_left == 0L
+      )
+  }
 } else {
-  tibble(level = character(), spots_left = integer(), lindy_level_sold_out = logical())
+  tibble(level = character(), leader_spots_left = integer(), lindy_level_sold_out = logical())
 }
 
 cat("\nLindy level capacity:\n")
@@ -178,14 +211,14 @@ df_registrations <- df_registrations |>
   left_join(level_capacity |> select(level, lindy_level_sold_out), by = "level") |>
   mutate(
     # A WAITLIST person is "sold out" when:
-    #   - Their Lindy level has no spots left, OR
-    #   - They registered for Lindy-only/Lindy+Solo but their level is full
-    # For Solo-only waitlist: the "find a leader" advice never applies → treat as sold out.
+    #   - Solo-only on waitlist (no leader logic applies), OR
+    #   - They are a leader on waitlist (leader quota necessarily full), OR
+    #   - Their Lindy level's leader-quota is filled (so they're a follower
+    #     beyond the overflow, can't be helped by a new leader)
     is_sold_out = case_when(
       status != "WAITLIST" ~ FALSE,
-      # Solo-only registrants (no lindy) — no leader logic applies
       !coalesce(lindy, FALSE) ~ TRUE,
-      # Lindy registrants — check whether their level has spots left
+      role == "leader" ~ TRUE,
       TRUE ~ coalesce(lindy_level_sold_out, FALSE)
     )
   )
@@ -537,11 +570,17 @@ for (i in 1:nrow(df_to_process)) {
         if (has_card_on_file) {
           cat("  Attempting off-session charge with stored card...\n")
           charge_amount <- reg$total_price * 100
+          stmt_suffix <- case_when(
+            coalesce(reg$solo_in, FALSE) ~ "Lindy + Solo Pass",
+            TRUE                         ~ "Lindy Pass"
+          )
           off_session_ok <- tryCatch({
             fn_create_off_session_payment(
               customer_id       = reg$stripe_customer_id,
               payment_method_id = reg$stripe_payment_method_id,
-              amount_cents      = charge_amount
+              amount_cents      = charge_amount,
+              description       = glue("MSSF 2026 - {reg$name}"),
+              statement_descriptor_suffix = stmt_suffix
             )
             TRUE
           }, error = function(e) {

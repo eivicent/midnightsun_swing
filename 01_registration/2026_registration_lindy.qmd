@@ -2,7 +2,7 @@
 title: "MSS 2026 Registration Processing"
 format: html
 execute:
-  warning: false
+    warning: false
   message: false
 ---
 
@@ -134,13 +134,21 @@ write_sheet(df_clean, ss = GOOGLE_SHEETS$registrations_2026, "clean_data")
 ```{r}
 #| label: quotas
 
-# Quotas derived from the single source of truth in config.R → GROUP_CAPACITIES
+# Quotas derived from the single source of truth in config.R
+# - quota = number of pair slots = leader capacity per level
+# - overflow_followers = extra follower-only confirmed spots above the pair quota
+#   (followers can fill quota + overflow_followers; leaders only quota)
 LINDY_QUOTAS <- tibble(
   level = c("intermediate", "int-advanced", "advanced"),
   quota = c(
     GROUP_CAPACITIES$intermediate,
     GROUP_CAPACITIES$intermediate_advanced,
     GROUP_CAPACITIES$advanced
+  ),
+  overflow_followers = c(
+    OVERFLOW_FOLLOWERS$intermediate,
+    OVERFLOW_FOLLOWERS$intermediate_advanced,
+    OVERFLOW_FOLLOWERS$advanced
   )
 )
 
@@ -161,53 +169,103 @@ cat("Hold period:", PARTNER_HOLD_DAYS, "days\n")
 #| label: helper-functions
 
 #' Match leaders and followers for a dance track
-#' 
+#'
 #' @param df Data frame with registrations for a specific track
-#' @param quota_df Data frame with level and quota columns (or single number for all levels)
+#' @param quota_df Data frame with `level` and `quota` columns, plus optional
+#'   `overflow_followers` (extra confirmed-follower slots above the pair quota).
+#'   If `overflow_followers` is missing it defaults to 0 for every level.
+#'   A single number can also be passed (applies the same quota to every level
+#'   with overflow = 0).
 #' @param hold_days Number of days to hold a spot for an unmatched partner before
 #'   treating the registrant as a single. 0 = no hold (immediate single matching).
 #' @param run_ts Fixed timestamp for this run (avoids Sys.time() drift)
 #' @param prev_pairs Optional tibble of ALL pairs from the previous run.
-#'   Eligible pairs are locked: their members are removed from matching pools
-#'   and they receive priority pair_numbers so they can never be pushed out
-#'   of the quota by new registrations.
-#' @return List with `pairs` (matched pairs with eligibility) and `on_hold`
-#'   (registrants still waiting for their partner within the hold period)
+#'   * COMPLETE eligible pairs are locked as units: both members are removed
+#'     from the matching pools and the pair is preserved as-is.
+#'   * INCOMPLETE eligible rows (overflow followers paired with NA leader, or
+#'     vice-versa) keep their member in the matching pool with a `was_locked`
+#'     flag so they get priority ordering. This lets them be re-paired with a
+#'     newly registered counterpart while preserving their CONFIRMED status.
+#' @return List with `pairs` (matched pairs with per-role eligibility and a
+#'   pair-level `eligible` flag) and `on_hold` (registrants still waiting for
+#'   their partner within the hold period)
 fn_match_partners <- function(df, quota_df, hold_days = 0,
                               run_ts = RUN_TIMESTAMP,
                               prev_pairs = NULL) {
-  
-  # Separate leaders and followers
+
+  # Normalise quota_df to a tibble with quota + overflow_followers columns
+  if (!is.data.frame(quota_df)) {
+    quota_df <- tibble(
+      level = unique(df$level),
+      quota = quota_df,
+      overflow_followers = 0L
+    )
+  } else if (!"overflow_followers" %in% names(quota_df)) {
+    quota_df <- quota_df |> mutate(overflow_followers = 0L)
+  }
+
+  # Separate leaders and followers (carry was_locked = FALSE by default)
   leaders <- df |>
     filter(role == "leader") |>
-    select(created_at, email, level, has_partner, partner_email)
-  
+    select(created_at, email, level, has_partner, partner_email) |>
+    mutate(was_locked = FALSE)
+
   followers <- df |>
     filter(role == "follower") |>
-    select(created_at, email, level, has_partner, partner_email)
-  
-  # ── Step 0: Lock ALL previously eligible pairs (couples + singles) ──
-  # Locked pairs keep their spots unconditionally. Their members are removed
-  # from the matching pools so they cannot be re-matched or displaced.
+    select(created_at, email, level, has_partner, partner_email) |>
+    mutate(was_locked = FALSE)
+
+  # ── Step 0: Categorise previously eligible pairs ──
+  # Complete pairs (both sides non-NA) → lock as units, remove members from pool.
+  # Incomplete pairs (one side NA) → keep the lone member in the pool, but
+  # tag them as was_locked = TRUE so they sort to the top of singles matching
+  # and stay CONFIRMED even if no counterpart appears this run.
   if (!is.null(prev_pairs) && nrow(prev_pairs) > 0) {
-    locked_pairs <- prev_pairs |> filter(eligible)
-    locked_emails <- c(
-      locked_pairs$email_leader[!is.na(locked_pairs$email_leader)],
-      locked_pairs$email_follower[!is.na(locked_pairs$email_follower)]
+    eligible_prev <- prev_pairs |> filter(eligible)
+
+    locked_pairs <- eligible_prev |>
+      filter(!is.na(email_leader), !is.na(email_follower))
+
+    lone_locked_leaders <- eligible_prev |>
+      filter(!is.na(email_leader),  is.na(email_follower)) |>
+      pull(email_leader) |>
+      unique()
+
+    lone_locked_followers <- eligible_prev |>
+      filter( is.na(email_leader), !is.na(email_follower)) |>
+      pull(email_follower) |>
+      unique()
+
+    locked_emails_complete <- c(
+      locked_pairs$email_leader,
+      locked_pairs$email_follower
     )
-    # Remove locked people from ALL pools (before couple matching + singles)
-    leaders   <- leaders   |> filter(!email %in% locked_emails)
-    followers <- followers |> filter(!email %in% locked_emails)
-    
-    cat("  Locked", nrow(locked_pairs), "previously eligible pairs (",
+
+    # Remove members of fully-paired locks from the matching pool
+    leaders   <- leaders   |> filter(!email %in% locked_emails_complete)
+    followers <- followers |> filter(!email %in% locked_emails_complete)
+
+    # Tag lone-locked individuals so they get priority during matching
+    leaders <- leaders |>
+      mutate(was_locked = email %in% lone_locked_leaders)
+    followers <- followers |>
+      mutate(was_locked = email %in% lone_locked_followers)
+
+    cat("  Locked", nrow(locked_pairs), "complete pairs (",
         sum(locked_pairs$is_couple), "couples,",
-        sum(!locked_pairs$is_couple), "singles pairs )\n")
+        sum(!locked_pairs$is_couple), "singles pairs ) +",
+        length(lone_locked_leaders), "lone leaders,",
+        length(lone_locked_followers), "lone followers (e.g. overflow)\n")
   } else {
-    locked_pairs <- NULL
+    locked_pairs           <- NULL
+    lone_locked_leaders    <- character()
+    lone_locked_followers  <- character()
   }
   
   # ── Step 1: Match registered couples (mutual partner reference + same level) ──
-  # Only runs on the REMAINING (non-locked) leaders and followers.
+  # Only runs on the REMAINING (non-locked-as-couple) leaders and followers.
+  # was_locked propagates onto the couple if EITHER side was previously locked
+  # alone (extremely rare, but preserves the priority promise).
   couples <- leaders |>
     filter(has_partner) |>
     inner_join(
@@ -216,20 +274,22 @@ fn_match_partners <- function(df, quota_df, hold_days = 0,
       suffix = c("_leader", "_follower")
     ) |>
     filter(email == partner_email_follower) |>
+    mutate(was_locked = was_locked_leader | was_locked_follower) |>
     select(
       email_leader = email,
       email_follower = partner_email,
       level,
       created_at_leader,
-      created_at_follower
+      created_at_follower,
+      was_locked
     ) |>
     mutate(is_couple = TRUE)
-  
+
   # ── Step 2: Unmatched partners (listed partner didn't register / different level) ──
   unmatched_leaders <- leaders |>
     filter(has_partner) |>
     anti_join(couples, by = c("email" = "email_leader"))
-  
+
   unmatched_followers <- followers |>
     filter(has_partner) |>
     anti_join(couples, by = c("email" = "email_follower"))
@@ -265,99 +325,139 @@ fn_match_partners <- function(df, quota_df, hold_days = 0,
     filter(!has_partner) |>
     bind_rows(expired_leaders |> select(-partner_email)) |>
     arrange(created_at)
-  
+
   single_followers <- followers |>
     filter(!has_partner) |>
     bind_rows(expired_followers |> select(-partner_email)) |>
     arrange(created_at)
-  
+
   # ── Step 3b: Match new singles by index within each level ──
+  # Previously-locked-lone individuals sort first (was_locked = TRUE), then
+  # everyone else by created_at. This ensures e.g. a confirmed overflow
+  # follower gets paired with a freshly-registered leader before any
+  # waitlisted follower does.
   single_leaders <- single_leaders |>
-    group_by(level) |> arrange(created_at) |> mutate(idx = row_number()) |> ungroup()
+    group_by(level) |>
+    arrange(desc(was_locked), created_at, .by_group = TRUE) |>
+    mutate(idx = row_number()) |>
+    ungroup()
   single_followers <- single_followers |>
-    group_by(level) |> arrange(created_at) |> mutate(idx = row_number()) |> ungroup()
-  
+    group_by(level) |>
+    arrange(desc(was_locked), created_at, .by_group = TRUE) |>
+    mutate(idx = row_number()) |>
+    ungroup()
+
   non_couples <- single_leaders |>
     full_join(single_followers, by = c("idx", "level"), suffix = c("_leader", "_follower")) |>
-    select(email_leader, email_follower, level, created_at_leader, created_at_follower) |>
+    mutate(
+      was_locked = coalesce(was_locked_leader, FALSE) |
+                   coalesce(was_locked_follower, FALSE)
+    ) |>
+    select(email_leader, email_follower, level,
+           created_at_leader, created_at_follower, was_locked) |>
     mutate(is_couple = FALSE)
   
   # ── Step 4: Combine new couples + new singles into "new_pairs" ──
   new_pairs <- bind_rows(couples, non_couples) |>
     mutate(
       created_at_pair = pmax(created_at_leader, created_at_follower, na.rm = TRUE),
-      is_locked = FALSE
+      is_locked = FALSE,
+      was_locked = coalesce(was_locked, FALSE)
     )
-  
+
   # ── Step 5: Combine locked + new, number with locked pairs first ──
-  # Locked pairs get priority pair_numbers (sorted by their original created_at_pair).
-  # New pairs are appended after, so they can only fill remaining quota slots.
+  # Fully-locked complete pairs sort first; then was_locked re-pairings (lone
+  # locked person finally completed); then everything else by created_at_pair.
   if (!is.null(locked_pairs) && nrow(locked_pairs) > 0) {
     locked_for_combine <- locked_pairs |>
       mutate(
         created_at_pair = pmax(created_at_leader, created_at_follower, na.rm = TRUE),
-        is_locked = TRUE
+        is_locked  = TRUE,
+        was_locked = TRUE
       ) |>
       select(email_leader, email_follower, level,
              created_at_leader, created_at_follower,
-             is_couple, created_at_pair, is_locked)
-    
+             is_couple, created_at_pair, is_locked, was_locked)
+
     all_pairs <- bind_rows(locked_for_combine, new_pairs)
   } else {
     all_pairs <- new_pairs
   }
-  
-  # Number pairs: locked first (preserving their order), then new by created_at_pair
+
+  # Number pairs: locked complete pairs first, then was_locked rows (re-paired
+  # overflow people), then new ones; within each tier, complete-before-incomplete
+  # then by created_at_pair.
   all_pairs <- all_pairs |>
     group_by(level) |>
     arrange(!is_locked,
+            !was_locked,
             is.na(email_leader) | is.na(email_follower),
             created_at_pair,
             .by_group = TRUE) |>
     mutate(pair_number = row_number()) |>
     ungroup()
-  
-  # Apply quotas: locked pairs are ALWAYS eligible; new pairs fill remaining slots
-  if (is.data.frame(quota_df)) {
-    all_pairs <- all_pairs |>
-      left_join(quota_df, by = "level") |>
-      mutate(
-        eligible = is_locked |
-          (pair_number <= quota &
-           !is.na(email_leader) & !is.na(email_follower))
-      )
-  } else {
-    all_pairs <- all_pairs |>
-      mutate(
-        quota = quota_df,
-        eligible = is_locked |
-          (pair_number <= quota &
-           !is.na(email_leader) & !is.na(email_follower))
-      )
-  }
-  
+
+  # ── Step 6: Per-role rank → eligibility (allows overflow followers) ──
+  # Within each level, rank leaders (and followers) separately by pair ordering.
+  # A leader is eligible iff leader_rank ≤ quota.
+  # A follower is eligible iff follower_rank ≤ follower_cap, where
+  #   follower_cap = min(eligible_leaders + overflow_followers,
+  #                      quota          + overflow_followers)
+  # i.e. she's allowed in if there's a leader to (notionally) pair with, plus
+  # `overflow_followers` extras on top of the current leader count, never
+  # exceeding the absolute ceiling of `quota + overflow_followers`.
+  all_pairs <- all_pairs |>
+    left_join(quota_df, by = "level") |>
+    group_by(level) |>
+    arrange(pair_number, .by_group = TRUE) |>
+    mutate(
+      leader_rank   = if_else(!is.na(email_leader),
+                              cumsum(!is.na(email_leader)),
+                              NA_integer_),
+      follower_rank = if_else(!is.na(email_follower),
+                              cumsum(!is.na(email_follower)),
+                              NA_integer_),
+      leader_eligible = !is.na(email_leader) & leader_rank <= quota,
+      eligible_leaders_in_level = sum(coalesce(leader_eligible, FALSE)),
+      follower_cap = pmin(eligible_leaders_in_level + coalesce(overflow_followers, 0L),
+                          quota + coalesce(overflow_followers, 0L))
+    ) |>
+    ungroup() |>
+    mutate(
+      follower_eligible = !is.na(email_follower) & follower_rank <= follower_cap,
+      eligible          = coalesce(leader_eligible, FALSE) |
+                          coalesce(follower_eligible, FALSE)
+    ) |>
+    select(-eligible_leaders_in_level, -follower_cap)
+
   list(pairs = all_pairs, on_hold = on_hold)
 }
 
 #' Convert paired data to individual eligibility
-#' 
-#' @param pairs_df Data frame with matched pairs
+#'
+#' Uses per-role eligibility (leader_eligible / follower_eligible) so a pair
+#' with `(NA, follower)` correctly grants confirmation to the follower without
+#' requiring a leader, and a `(leader, NA)` row leaves any unmatched follower
+#' on her own row to be evaluated independently.
+#'
+#' @param pairs_df Data frame with matched pairs (must contain leader_eligible
+#'   and follower_eligible)
 #' @param track_name Name of the track (for column naming)
 #' @return Data frame with email and eligibility status
 fn_pairs_to_individual <- function(pairs_df, track_name) {
   col_name <- paste0(track_name, "_in")
-  
-  pairs_df |>
-    select(email_leader, email_follower, eligible) |>
-    pivot_longer(
-      cols = c(email_leader, email_follower),
-      names_to = "role",
-      values_to = "email"
-    ) |>
-    filter(!is.na(email)) |>
-    # Collapse to one row per email; eligible if ANY pair grants eligibility
+
+  leaders <- pairs_df |>
+    filter(!is.na(email_leader)) |>
+    transmute(email = email_leader, is_in = coalesce(leader_eligible, FALSE))
+
+  followers <- pairs_df |>
+    filter(!is.na(email_follower)) |>
+    transmute(email = email_follower, is_in = coalesce(follower_eligible, FALSE))
+
+  bind_rows(leaders, followers) |>
     group_by(email) |>
-    summarise(!!col_name := any(eligible), .groups = "drop")
+    summarise(!!col_name := any(is_in), .groups = "drop")
 }
 ```
 
@@ -395,9 +495,11 @@ lindy_on_hold <- lindy_result$on_hold
 lindy_summary <- lindy_pairs |>
   group_by(level) |>
   summarise(
-    complete_pairs = sum(!is.na(email_leader) & !is.na(email_follower)),
-    eligible_pairs = sum(eligible, na.rm = TRUE),
-    quota = first(quota),
+    complete_pairs       = sum(!is.na(email_leader) & !is.na(email_follower)),
+    confirmed_leaders    = sum(coalesce(leader_eligible,   FALSE)),
+    confirmed_followers  = sum(coalesce(follower_eligible, FALSE)),
+    quota                = first(quota),
+    overflow_followers   = first(overflow_followers),
     .groups = "drop"
   )
 
@@ -691,10 +793,12 @@ lindy_pairs_display <- lindy_pairs |>
     leader_paid = coalesce(str_to_lower(payment_status_leader) == "captured" | str_detect(str_to_lower(payment_status_leader), "paid"), FALSE),
     follower_paid = coalesce(str_to_lower(payment_status_follower) == "captured" | str_detect(str_to_lower(payment_status_follower), "paid"), FALSE)
   ) |>
-  select(level, pair_number, leader_name, leader_email = email_leader, leader_paid,
-         created_at_leader,
+  select(level, pair_number,
+         leader_name, leader_email = email_leader, leader_paid,
+         leader_eligible, created_at_leader,
          follower_name, follower_email = email_follower, follower_paid,
-         is_couple, eligible, created_at_follower) |>
+         follower_eligible, created_at_follower,
+         is_couple, eligible) |>
   arrange(level, pair_number)
 
 # Define sheet names per level
@@ -707,26 +811,46 @@ levels_to_write <- list(
 # Write each level to its own sheet with a summary header
 for (sheet_name in names(levels_to_write)) {
   lvl <- levels_to_write[[sheet_name]]
-  lvl_data <- lindy_pairs_display |> filter(level == lvl) |> select(-level)
-  quota_val <- LINDY_QUOTAS |> filter(level == lvl) |> pull(quota)
+  lvl_pairs <- lindy_pairs |> filter(level == lvl)
+  lvl_data  <- lindy_pairs_display |> filter(level == lvl) |> select(-level)
 
-  complete    <- sum(!is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
-  no_leader   <- sum(is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
-  no_follower <- sum(!is.na(lvl_data$leader_email) & is.na(lvl_data$follower_email))
-  spots_left  <- max(0, quota_val - complete)
+  quota_val    <- LINDY_QUOTAS |> filter(level == lvl) |> pull(quota)
+  overflow_val <- LINDY_QUOTAS |> filter(level == lvl) |> pull(overflow_followers)
+
+  complete             <- sum(!is.na(lvl_data$leader_email) & !is.na(lvl_data$follower_email))
+  confirmed_leaders    <- sum(coalesce(lvl_pairs$leader_eligible,   FALSE))
+  confirmed_followers  <- sum(coalesce(lvl_pairs$follower_eligible, FALSE))
+  overflow_followers_active <- max(0L, confirmed_followers - confirmed_leaders)
+  leader_spots_left    <- max(0L, quota_val - confirmed_leaders)
+  follower_spots_left  <- max(0L, (quota_val + overflow_val) - confirmed_followers)
 
   # Summary block (written to rows 1-2)
   summary_df <- tibble(
-    Metric = c("Quota", "Complete pairs", "Missing leaders", "Missing followers", "Spots left"),
-    Value  = c(quota_val, complete, no_leader, no_follower, spots_left)
+    Metric = c(
+      "Pair quota", "Follower overflow",
+      "Complete pairs",
+      "Confirmed leaders", "Confirmed followers",
+      "Overflow followers (currently)",
+      "Leader spots left", "Follower spots left"
+    ),
+    Value = c(
+      quota_val, overflow_val,
+      complete,
+      confirmed_leaders, confirmed_followers,
+      overflow_followers_active,
+      leader_spots_left, follower_spots_left
+    )
   )
 
   # Write summary first (creates/overwrites the sheet)
   write_sheet(summary_df, ss = GOOGLE_SHEETS$registrations_2026, sheet = sheet_name)
-  # Append pairs table starting at row 4 (leaving a blank row separator)
-  range_write(lvl_data, ss = GOOGLE_SHEETS$registrations_2026, sheet = sheet_name, range = "A4")
+  # Append pairs table starting after the summary (leave one blank row)
+  range_write(lvl_data, ss = GOOGLE_SHEETS$registrations_2026, sheet = sheet_name,
+              range = paste0("A", nrow(summary_df) + 3))
 
-  cat("Written sheet:", sheet_name, "—", complete, "complete pairs,", spots_left, "spots left\n")
+  cat("Written sheet:", sheet_name, "—", complete, "complete pairs,",
+      leader_spots_left, "leader spots left,",
+      follower_spots_left, "follower spots left\n")
 }
 ```
 

@@ -57,12 +57,24 @@ PRICING <- list(
 
 # Group capacities (number of couples/pairs for partnered tracks, individuals for solo)
 GROUP_CAPACITIES <- list(
-  intermediate = 22,
+  intermediate = 23,
   intermediate_advanced = 25,
   advanced = 45,
   solo = 40,
   # Blues workshop: single level
   blues_intermediate_plus = 22
+)
+
+# Follower overflow: extra confirmed follower spots above the pair quota per level.
+# Rationale: leaders are typically scarcer than followers; admitting a small
+# surplus of followers as CONFIRMED keeps everyone moving while still leaving
+# room for a leader who arrives later to be paired with one of them.
+# Set to 0 for any level to disable overflow there.
+OVERFLOW_FOLLOWERS <- list(
+  intermediate = 2,
+  intermediate_advanced = 0,
+  advanced = 3,
+  blues_intermediate_plus = 2
 )
 
 # Email subject lines

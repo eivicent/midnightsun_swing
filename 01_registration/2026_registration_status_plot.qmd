@@ -34,12 +34,21 @@ LINDY_QUOTAS <- tibble(
     GROUP_CAPACITIES$intermediate,
     GROUP_CAPACITIES$intermediate_advanced,
     GROUP_CAPACITIES$advanced
+  ),
+  overflow_followers = c(
+    OVERFLOW_FOLLOWERS$intermediate,
+    OVERFLOW_FOLLOWERS$intermediate_advanced,
+    OVERFLOW_FOLLOWERS$advanced
   )
 )
 
 if (!"quota" %in% names(lindy_pairs)) {
   lindy_pairs <- lindy_pairs |>
     left_join(LINDY_QUOTAS, by = "level")
+} else if (!"overflow_followers" %in% names(lindy_pairs)) {
+  # Backward-compat: locked sheet predates the overflow column
+  lindy_pairs <- lindy_pairs |>
+    left_join(LINDY_QUOTAS |> select(level, overflow_followers), by = "level")
 }
 
 # ── Festival palette ──
@@ -49,13 +58,17 @@ col_bg     <- "#FFE17B"   # golden yellow (background)
 col_accent <- "#4E332E"   # dark brown
 
 # ── Counts per level + role ──
+# Each role has its own capacity:
+#   leader_capacity   = quota
+#   follower_capacity = quota + overflow_followers
 reg_counts <- lindy_pairs |>
   group_by(level) |>
   summarise(
-    Leaders   = sum(!is.na(email_leader)),
-    Followers = sum(!is.na(email_follower)),
-    quota     = first(quota),
-    .groups   = "drop"
+    Leaders            = sum(!is.na(email_leader)),
+    Followers          = sum(!is.na(email_follower)),
+    leader_capacity    = first(quota),
+    follower_capacity  = first(quota) + coalesce(first(overflow_followers), 0L),
+    .groups            = "drop"
   ) |>
   pivot_longer(
     cols      = c(Leaders, Followers),
@@ -63,14 +76,15 @@ reg_counts <- lindy_pairs |>
     values_to = "registered"
   ) |>
   mutate(
-    remaining = pmax(quota - registered, 0),
+    capacity = if_else(role == "Leaders", leader_capacity, follower_capacity),
+    remaining = pmax(capacity - registered, 0),
     level     = factor(
       level,
       levels = c("intermediate", "int-advanced", "advanced"),
       labels = c("Intermediate", "Int-Advanced", "Advanced")
     ),
-    pct   = registered / quota,
-    label = paste0(registered, " / ", quota)
+    pct   = registered / capacity,
+    label = paste0(registered, " / ", capacity)
   )
 
 # ── Long format for stacked bars ──
@@ -106,7 +120,7 @@ ggplot(bar_data, aes(x = role, y = count, fill = status)) +
   ) +
   geom_text(
     data    = reg_counts,
-    aes(x = role, y = quota, label = label, fill = NULL),
+    aes(x = role, y = capacity, label = label, fill = NULL),
     vjust   = -0.6, colour = col_filled, fontface = "bold", size = 4
   ) +
   facet_wrap(~ level, nrow = 1) +
@@ -159,10 +173,10 @@ ig_plot <- ggplot(bar_data, aes(x = level, y = count, fill = status)) +
         label = percent(pct, accuracy = 1), fill = NULL),
     colour = "white", fontface = "bold", size = 5.5
   ) +
-  # "n / quota" to the right of each bar
+  # "n / capacity" to the right of each bar
   geom_text(
     data  = reg_counts,
-    aes(x = level, y = quota, label = label, fill = NULL),
+    aes(x = level, y = capacity, label = label, fill = NULL),
     hjust = -0.15, colour = col_filled, fontface = "bold", size = 4.5
   ) +
   coord_flip() +
