@@ -438,7 +438,9 @@ for (i in 1:nrow(df_to_process)) {
             fn_create_off_session_payment(
               customer_id       = reg$stripe_customer_id,
               payment_method_id = reg$stripe_payment_method_id,
-              amount_cents      = charge_amount
+              amount_cents      = charge_amount,
+              description       = glue("MSS 2026 Blues - Re-charge for {reg$email}"),
+              statement_descriptor_suffix = "BLUES"
             )
             TRUE
           }, error = function(e) {

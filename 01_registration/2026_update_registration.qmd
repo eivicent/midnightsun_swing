@@ -28,8 +28,9 @@ and the new **value** to set.
 
 updates <- tribble(
   ~id,                        ~field,             ~value,
-  "4qVDgrEpoLV9PkIF1otZ",            "payment_status",    "captured"
-  
+  "t94KYqaSmzZdnGlqehWI",            "payment_status",    "captured",
+  "oByIWTeodvazHn6VSoER",            "payment_status",    "captured",
+  "jP3g9tajeioamZ3eWYGB",            "payment_status",    "captured"
 )
 
 # Normalise email values

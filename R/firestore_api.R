@@ -443,10 +443,17 @@ fn_cancel_preauth <- function(payment_intent_id) {
 #' @param customer_id Stripe Customer ID (starts with cus_)
 #' @param payment_method_id Stripe PaymentMethod ID (starts with pm_)
 #' @param amount_cents Amount to charge in cents
+#' @param description Internal description visible in Stripe Dashboard
+#'   (default: "MSS - Off-session re-charge")
+#' @param statement_descriptor_suffix Appended to your account's default
+#'   statement descriptor (max 22 chars). E.g. "LINDY" → "MSS* LINDY"
+#'   on the customer's card statement.
 #' @return Stripe PaymentIntent object
 #' @export
 fn_create_off_session_payment <- function(customer_id, payment_method_id,
-                                          amount_cents) {
+                                          amount_cents,
+                                          description = "MSS - Off-session re-charge",
+                                          statement_descriptor_suffix = "FESTIVAL") {
   stripe_key <- fn_get_stripe_key()
   resp <- request(paste0(STRIPE_BASE_URL, "/payment_intents")) |>
     req_auth_basic(stripe_key, "") |>
@@ -457,7 +464,9 @@ fn_create_off_session_payment <- function(customer_id, payment_method_id,
       customer = customer_id,
       payment_method = payment_method_id,
       confirm = "true",
-      off_session = "true"
+      off_session = "true",
+      description = description,
+      statement_descriptor_suffix = statement_descriptor_suffix
     ) |>
     req_error(is_error = function(resp) FALSE) |>
     req_perform()
